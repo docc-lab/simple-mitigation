@@ -1,0 +1,114 @@
+# One CustomPodAutoscaler per victim Deployment. To add a victim (e.g. profile)
+# copy this file, replace the name, scaleTargetRef.name, and TARGET_SELECTOR.
+#
+# The CPA operator must be installed in the cluster first:
+#   helm install cpa custompodautoscaler/custom-pod-autoscaler-operator
+# See: https://github.com/jthomperoo/custom-pod-autoscaler-operator
+#
+# The Pod the operator provisions runs two containers:
+#  - cpa     : the unmodified upstream CPA binary, which polls our sidecar
+#  - sidecar : our Go HTTP server that maintains gRPC streams to victim pods
+# They communicate over the Pod's shared loopback at localhost:8080.
+apiVersion: custompodautoscaler.com/v1
+kind: CustomPodAutoscaler
+metadata:
+  name: horizontal-search
+  namespace: hotelres
+  labels:
+    app.kubernetes.io/name: horizontal-cpa
+    target: search
+spec:
+  template:
+    spec:
+      serviceAccountName: horizontal-cpa
+      containers:
+        - name: cpa
+          image: custompodautoscaler/python:latest
+          imagePullPolicy: IfNotPresent
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+            limits:
+              cpu: "200m"
+              memory: "128Mi"
+        - name: sidecar
+          image: REGISTRY/simple-mitigation/horizontal-cpa-sidecar:dev
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: TARGET_NAMESPACE
+              value: hotelres
+            - name: TARGET_SELECTOR
+              value: "app.kubernetes.io/name=search"
+            - name: SCORE_PORT
+              value: "7900"
+            - name: MIN_REPLICAS
+              value: "1"
+            - name: MAX_REPLICAS
+              value: "10"
+            - name: HI
+              value: "0.5"
+            - name: LO
+              value: "0.2"
+            - name: MIN_HOLD_WINDOWS
+              value: "3"
+            - name: COOLDOWN_SEC
+              value: "30"
+            - name: STALE_MS
+              value: "1500"
+            - name: AGG
+              value: "max"
+            - name: DOWNSCALE_BLOCK_TAIL
+              value: "0.5"
+          ports:
+            - name: http
+              containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 2
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+            limits:
+              cpu: "200m"
+              memory: "128Mi"
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: search
+  config:
+    # Keep these in sync with the sidecar's MIN_REPLICAS / MAX_REPLICAS env.
+    - name: minReplicas
+      value: "1"
+    - name: maxReplicas
+      value: "10"
+    - name: interval
+      value: "1000"
+    - name: startTime
+      value: "1"
+    - name: runMode
+      value: "per-resource"
+    - name: downscaleStabilization
+      value: "0"
+    - name: metric
+      value: |
+        type: "http"
+        timeout: 2500
+        http:
+          method: "GET"
+          url: "http://localhost:8080/metric"
+          successCodes: [200]
+          parameterMode: query
+    - name: evaluate
+      value: |
+        type: "http"
+        timeout: 2500
+        http:
+          method: "POST"
+          url: "http://localhost:8080/evaluate"
+          successCodes: [200]
+          parameterMode: body

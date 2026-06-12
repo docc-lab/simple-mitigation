@@ -1,0 +1,12 @@
+bin/
+*.exe
+*.test
+*.out
+
+gen/
+
+vendor/
+.idea/
+.vscode/
+*.swp
+*.swo

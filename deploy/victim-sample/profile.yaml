@@ -1,0 +1,58 @@
+# Second victim, shown here to demonstrate the multi-target shape used by
+# the vertical-scaler ConfigMap. Identical structure to search.yaml.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: profile
+  namespace: hotelres
+  labels:
+    app.kubernetes.io/name: profile
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: profile
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: profile
+    spec:
+      containers:
+        - name: profile
+          image: REGISTRY/profile:tag
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: grpc
+              containerPort: 8081
+            - name: score
+              containerPort: 7900
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "512Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+          resizePolicy:
+            - resourceName: cpu
+              restartPolicy: NotRequired
+            - resourceName: memory
+              restartPolicy: NotRequired
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: profile
+  namespace: hotelres
+  labels:
+    app.kubernetes.io/name: profile
+spec:
+  selector:
+    app.kubernetes.io/name: profile
+  ports:
+    - name: grpc
+      port: 8081
+      targetPort: grpc
+    - name: score
+      port: 7900
+      targetPort: score

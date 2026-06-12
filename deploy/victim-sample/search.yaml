@@ -1,0 +1,68 @@
+# Sample victim Deployment. Three things in here matter for the mitigations
+# to work end-to-end:
+#
+#  1. The container exposes :7900 (named "score") -- this is the
+#     ContentionStream gRPC endpoint.
+#  2. resources.requests == resources.limits for cpu+memory, so the pod is
+#     scheduled at QoS = Guaranteed -- a prerequisite for in-place resize.
+#  3. resizePolicy[*].restartPolicy: NotRequired tells the kubelet to apply
+#     CPU resize patches without restarting the container.
+#
+# Replace the image and command with your real search service; this is just
+# a scaffold.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: search
+  namespace: hotelres
+  labels:
+    app.kubernetes.io/name: search
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: search
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: search
+    spec:
+      containers:
+        - name: search
+          image: REGISTRY/search:tag
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: grpc
+              containerPort: 8081
+            - name: score
+              containerPort: 7900
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "512Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+          resizePolicy:
+            - resourceName: cpu
+              restartPolicy: NotRequired
+            - resourceName: memory
+              restartPolicy: NotRequired
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: search
+  namespace: hotelres
+  labels:
+    app.kubernetes.io/name: search
+spec:
+  selector:
+    app.kubernetes.io/name: search
+  ports:
+    - name: grpc
+      port: 8081
+      targetPort: grpc
+    - name: score
+      port: 7900
+      targetPort: score

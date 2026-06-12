@@ -1,0 +1,24 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: vertical-scaler-targets
+  namespace: mitigation-system
+data:
+  targets.yaml: |
+    # One entry per victim service. Adding a target requires editing this
+    # ConfigMap and waiting for the pod to pick it up (or kubectl rollout
+    # restart deploy/vertical-scaler if you don't want to wait for the kubelet
+    # to remount).
+    targets:
+      - name: search
+        namespace: hotelres
+        selector:
+          app.kubernetes.io/name: search
+        scorePort: 7900
+        containerName: search
+      - name: profile
+        namespace: hotelres
+        selector:
+          app.kubernetes.io/name: profile
+        scorePort: 7900
+        containerName: profile

@@ -1,0 +1,31 @@
+syntax = "proto3";
+
+package gordion.contention;
+
+option go_package = "github.com/coding-workspace/simple-mitigation-1/gen/go/contentionpb;contentionpb";
+
+// ContentionStream is the per-pod score interface. Any client (mitigation
+// controller, notebook, exporter) can subscribe to a stream of ScoreEvent
+// messages; each subscriber has its own filter and bounded buffer.
+service ContentionStream {
+  rpc Subscribe(ScoreSubscribeReq) returns (stream ScoreEvent);
+}
+
+message ScoreSubscribeReq {
+  // Optional list of gRPC method names to keep; empty = all methods.
+  repeated string only_methods = 1;
+  // Producer-side filter: drop events with p50_trend_pred below this.
+  float min_p50_trend  = 2;
+  // Producer-side filter: drop events with tail_trend_label below this.
+  float min_tail_trend = 3;
+}
+
+message ScoreEvent {
+  int64  sample_id        = 1;
+  int64  timestamp_ns     = 2;
+  string service          = 3;   // e.g. "search"
+  float  p50_trend_pred   = 4;   // [0, 1] -- p50-side trend
+  float  tail_trend_label = 5;   // [0, 1] -- p90/p99-combined tail trend
+  string model_version    = 6;   // changes with each retrain
+  string source_kind      = 7;   // "onnx" | "formula" | ...
+}
