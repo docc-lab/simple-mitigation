@@ -4,7 +4,7 @@ MODULE    := github.com/coding-workspace/simple-mitigation-1
 PROTO_DIR := proto
 GEN_DIR   := gen/go/contentionpb
 
-.PHONY: all build proto deps test clean tidy docker-horizontal docker-vertical
+.PHONY: all build proto deps test clean tidy docker-controller
 
 all: build
 
@@ -35,8 +35,7 @@ test:
 clean:
 	rm -rf $(GEN_DIR) bin/
 
-docker-horizontal:
-	docker build -f cmd/horizontal-cpa-sidecar/Dockerfile -t simple-mitigation/horizontal-cpa-sidecar:dev .
-
-docker-vertical:
-	docker build -f cmd/vertical-scaler/Dockerfile -t simple-mitigation/vertical-scaler:dev .
+# Single-binary DaemonSet image. Replaces the v1 docker-horizontal /
+# docker-vertical targets.
+docker-controller:
+	docker build -f cmd/mitigation-controller/Dockerfile -t simple-mitigation/mitigation-controller:dev .

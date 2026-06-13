@@ -56,6 +56,9 @@ type Watcher struct {
 	target *targets.Target
 	client kubernetes.Interface
 	selStr string
+	// nodeFieldSel narrows the informer to pods on a single node when the
+	// watcher was constructed via NewLocalNodeWatcher. Empty means cluster-wide.
+	nodeFieldSel string
 
 	out      chan Event
 	stopCh   chan struct{}
@@ -80,6 +83,22 @@ func NewWatcher(client kubernetes.Interface, target *targets.Target) (*Watcher, 
 	}, nil
 }
 
+// NewLocalNodeWatcher is like NewWatcher but restricts the informer to pods
+// whose spec.nodeName matches nodeName. Used by the per-node DaemonSet
+// controller so each instance only ever sees its own victim pods. nodeName
+// must be non-empty.
+func NewLocalNodeWatcher(client kubernetes.Interface, target *targets.Target, nodeName string) (*Watcher, error) {
+	if nodeName == "" {
+		return nil, fmt.Errorf("podwatch: nodeName is required for local-node watcher")
+	}
+	w, err := NewWatcher(client, target)
+	if err != nil {
+		return nil, err
+	}
+	w.nodeFieldSel = "spec.nodeName=" + nodeName
+	return w, nil
+}
+
 // Run starts the informer and blocks until ctx is cancelled or Stop is called.
 // Returns nil on clean stop.
 func (w *Watcher) Run(ctx context.Context) error {
@@ -89,6 +108,9 @@ func (w *Watcher) Run(ctx context.Context) error {
 		informers.WithNamespace(w.target.Namespace),
 		informers.WithTweakListOptions(func(lo *metav1.ListOptions) {
 			lo.LabelSelector = w.selStr
+			if w.nodeFieldSel != "" {
+				lo.FieldSelector = w.nodeFieldSel
+			}
 		}),
 	)
 	informer := factory.Core().V1().Pods().Informer()

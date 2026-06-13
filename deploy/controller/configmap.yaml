@@ -1,0 +1,57 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mitigation-controller-config
+  namespace: mitigation-system
+data:
+  # One entry per victim service. Mirrors the v1 vertical-scaler-targets
+  # ConfigMap; the new controller reads the same schema.
+  targets.yaml: |
+    targets:
+      - name: search
+        namespace: hotelres
+        selector:
+          app.kubernetes.io/name: search
+        scorePort: 7900
+        containerName: search
+      - name: profile
+        namespace: hotelres
+        selector:
+          app.kubernetes.io/name: profile
+        scorePort: 7900
+        containerName: profile
+
+  # Default policy from plan-v2-centralized.md Section 5. Edit in place;
+  # the controller reloads on file change via fsnotify.
+  policy.yaml: |
+    rules:
+      - name: sharp_rising_spike
+        when: "k_temporal > 0.3 || k_spatial > 0.3"
+        fire:
+          - kind: isolate
+            params:
+              throttle_fraction: 0.5
+              aggressor_selector: "tier=batch"
+          - kind: vertical
+            params:
+              scale_factor: 1.5
+        cooldown: "30s"
+        priority: 100
+
+      - name: sustained_high_p50
+        when: "p50_now > 0.5 && persistence_h >= 3 && duration_above_hi_ms >= 2000"
+        fire:
+          - kind: horizontal
+            params:
+              delta: 1
+        cooldown: "60s"
+        priority: 50
+
+      - name: clean_state
+        when: "p50_now < 0.2 && k_temporal < 0 && tail_now < 0.5"
+        fire:
+          - kind: restore
+            params:
+              tier: all
+        cooldown: "60s"
+        priority: 10

@@ -1,44 +1,57 @@
 # simple-mitigation
 
-Two K8s controllers that consume the per-pod `ContentionStream` gRPC API
-(see [`Mitigation-interface.md`](Mitigation-interface.md)) and react to
-contention by:
+A single Go binary that consumes the per-pod `ContentionStream` gRPC API
+(see [`Mitigation-interface.md`](Mitigation-interface.md)), evaluates a CEL
+policy each tick, and fires one of three mitigation tiers:
 
-| Controller                | Surface                            | Cadence | Scope                          |
-| ------------------------- | ---------------------------------- | ------- | ------------------------------ |
-| `horizontal-cpa-sidecar`  | Deployment replicas (via CPA)      | ~1 s    | One CPA Pod per victim Deploy. |
-| `vertical-scaler`         | `pods/resize` subresource (cpu)    | 100 ms  | One Deploy, multi-victim       |
+| Tier         | Surface                                        | Timescale | Actuator               |
+| ------------ | ---------------------------------------------- | --------: | ---------------------- |
+| `isolate`    | cgroup v2 `cpu.max` on co-located aggressors   |  ~100 ms  | `pkg/actuators/isolate`  |
+| `vertical`   | `pods/resize` subresource (cpu requests/limits) |   ~1 s    | `pkg/actuators/vertical` |
+| `horizontal` | `apps/v1.Deployment/scale` subresource          |  ~10 s+   | `pkg/actuators/horizontal` |
 
-The third mitigation from the plan (an isolating DaemonSet) is intentionally
-out of scope for now.
+The binary runs as a privileged `DaemonSet` -- one instance per node. Each
+instance subscribes only to victim pods on its own node (field selector
+`spec.nodeName=$NODE_NAME`), so node-local mitigations are race-free
+without leader election. Horizontal scale is coordinated K8s-natively via
+an idempotent `/scale` patch + a `mitigation/horizontal-last-scaled-at`
+cooldown annotation on the Deployment.
+
+See [`plan-v2-centralized.md`](plan-v2-centralized.md) for the full design.
 
 ## Architecture
 
 ```
-   victim pod   100 ms      sidecar (in CPA pod)        1 s
-   :7900  ───gRPC stream──▶  /metric  /evaluate  ◀──HTTP──  CPA bin ──scale──▶ Deployment
-   :7900  ───gRPC stream──▶  vertical-scaler           ──PATCH pods/resize──▶ each pod
+   victim pod (this node)             mitigation-controller (this node, DaemonSet)
+   :7900 ──gRPC stream──▶  scoreclient ──▶ features (rolling window per pod)
+                                                    ↓
+                                            policy (CEL rules)
+                                                    ↓
+                                ┌──────────────┬──────────────┐
+                                ▼              ▼              ▼
+                            isolate         vertical      horizontal
+                            (cpu.max)    (pods/resize) (deploy/scale)
 ```
-
-Both controllers share `pkg/scoreclient`, `pkg/podwatch`, `pkg/thresholder`,
-and `pkg/aggregator`. The wire contract is vendored in
-[`proto/contention.proto`](proto/contention.proto); Go stubs are generated
-into `gen/go/contentionpb/` (gitignored) by `make proto`.
 
 ## Repo layout
 
 ```
-proto/contention.proto                  vendored wire contract
+proto/contention.proto                  vendored wire contract (3 spatial-horizon fields added)
 gen/go/contentionpb/                    generated (gitignored) -- run `make proto`
 pkg/targets/                            multi-victim config loader
 pkg/scoreclient/                        gRPC subscriber w/ reconnect + multi-pod fan-in
-pkg/aggregator/                         pluggable Max / Mean / P90 policy
-pkg/thresholder/                        HI/LO + cooldown state machine
-pkg/podwatch/                           client-go informer for a single target
-cmd/horizontal-cpa-sidecar/             /metric + /evaluate HTTP server for CPA
-cmd/vertical-scaler/                    multi-target pods/resize controller
-deploy/horizontal/                      CustomPodAutoscaler CRs + RBAC
-deploy/vertical/                        Deployment + RBAC + targets ConfigMap
+pkg/podwatch/                           client-go informer (+ NewLocalNodeWatcher for the DaemonSet)
+pkg/features/                           rolling window + spatial/temporal feature computation
+pkg/policy/                             CEL env, YAML rule loader, fsnotify hot-reload, engine
+pkg/cgroup/                             cgroup v2 path resolution + cpu.max read/write
+pkg/actuators/                          shared interface + annotation key constants
+pkg/actuators/isolate/                  throttles aggressor pods' cpu.max
+pkg/actuators/vertical/                 patches pods/resize for the victim pod
+pkg/actuators/horizontal/               patches deployments/scale for the victim Deployment
+pkg/aggregator/                         pluggable Max / Mean / P90 (callable from rules)
+pkg/thresholder/                        HI/LO + cooldown state machine (also exposed to CEL via `band`)
+cmd/mitigation-controller/              the only binary
+deploy/controller/                      DaemonSet, RBAC, ConfigMap (targets + policy)
 deploy/victim-sample/                   sample search + profile Deployments
 ```
 
@@ -52,46 +65,118 @@ make deps         # installs protoc-gen-go + protoc-gen-go-grpc
 make proto        # generates gen/go/contentionpb/*.pb.go
 go mod tidy
 make build        # equivalent to `go build ./...`
-make test         # runs the thresholder unit tests
+make test         # runs all unit tests
 ```
 
-To produce container images:
+Build the container image:
 
 ```bash
-make docker-horizontal
-make docker-vertical
+make docker-controller
 ```
 
-The Dockerfiles run `make proto` inside the build stage so a fresh clone
-builds end-to-end with `docker build` alone.
+The Dockerfile runs `make proto` inside the build stage, so `docker build`
+works from a fresh clone.
+
+## Default policy (out of the box)
+
+Three rules ship in [`deploy/controller/configmap.yaml`](deploy/controller/configmap.yaml),
+matching plan-v2-centralized.md Section 5 verbatim:
+
+```yaml
+rules:
+  - name: sharp_rising_spike
+    when: "k_temporal > 0.3 || k_spatial > 0.3"
+    fire:
+      - kind: isolate
+        params: { throttle_fraction: 0.5, aggressor_selector: "tier=batch" }
+      - kind: vertical
+        params: { scale_factor: 1.5 }
+    cooldown: "30s"
+    priority: 100
+
+  - name: sustained_high_p50
+    when: "p50_now > 0.5 && persistence_h >= 3 && duration_above_hi_ms >= 2000"
+    fire:
+      - kind: horizontal
+        params: { delta: 1 }
+    cooldown: "60s"
+    priority: 50
+
+  - name: clean_state
+    when: "p50_now < 0.2 && k_temporal < 0 && tail_now < 0.5"
+    fire:
+      - kind: restore
+        params: { tier: all }
+    cooldown: "60s"
+    priority: 10
+```
+
+`restore` is a meta-action: it fans out to every actuator's `Restore()`,
+which reads the `mitigation/*` annotations on the corresponding object and
+reverses the most recent action.
+
+### CEL vocabulary
+
+All feature fields are top-level identifiers (no wrapper object). Match the
+field names in `features.FeatureVector`:
+
+| Identifier              | Type            | Meaning                                                            |
+| ----------------------- | --------------- | ------------------------------------------------------------------ |
+| `target`                | string          | victim service name                                                |
+| `pod`                   | string          | victim pod name                                                    |
+| `p50_now`, `tail_now`   | double          | latest p50_trend_pred / tail_trend_label                           |
+| `p50_h`, `tail_h`       | list(double)    | multi-horizon arrays (empty under a single-horizon predictor)      |
+| `horizon_ms`            | list(int)       | parallel array of horizon offsets                                  |
+| `k_spatial`             | double          | least-squares slope of p50_h vs horizon_ms                         |
+| `accel_spatial`         | double          | mean second-difference of p50_h                                    |
+| `p50_max_horizon_ms`    | int             | argmax horizon                                                     |
+| `persistence_h`         | int             | count of p50_h entries >= HI_THRESHOLD                             |
+| `k_temporal`            | double          | least-squares slope of p50 over the rolling window (per second)    |
+| `accel_temporal`        | double          | mean second-difference over the window                             |
+| `variance`              | double          | sample variance over the window                                    |
+| `duration_above_hi_ms`  | int             | length of the most recent contiguous run above HI_THRESHOLD        |
+| `window_size`           | int             | samples currently in the rolling window                            |
+| `has_spatial`           | bool            | `true` iff the latest event populated `p50_horizons`               |
+| `model_version`         | string          | latest event's model_version                                       |
+| `source_kind`           | string          | latest event's source_kind ("onnx" / "formula" / ...)              |
+
+Two helper functions are registered:
+
+- `band(score, lo, hi) string` -> `"up"` / `"down"` / `"stable"`
+- `count_at_least(list, threshold) int` -> count of list entries `>= threshold`
+
+### Authoring workflow
+
+1. Edit `data.policy.yaml` in the ConfigMap.
+2. Apply: `kubectl apply -f deploy/controller/configmap.yaml`.
+3. The kubelet remounts the volume; `fsnotify` in `pkg/policy/loader.go`
+   triggers `engine.Reload` within ~1s. Look for `policy reloaded` in the
+   controller logs.
+
+A typo in a CEL expression is rejected by `engine.Reload` and the previous
+rules stay live -- the controller never goes silent on a bad rule.
 
 ## Default thresholds (explicit)
 
-Baked into both binaries as constants; every value is overridable by env
-(horizontal) or env + ConfigMap (vertical). See the `defaultXxx` constants
-in each `main.go` and the env table in `deploy/`.
-
-| Param                  | Horizontal | Vertical |
-| ---------------------- | ---------: | -------: |
-| HI (p50 fire-up)       |        0.5 |      0.5 |
-| LO (p50 fire-down)     |        0.2 |      0.2 |
-| MIN_HOLD_WINDOWS       |          3 |        5 |
-| COOLDOWN_SEC           |         30 |       60 |
-| MIN_REPLICAS / MIN_CPU |          1 |     200m |
-| MAX_REPLICAS / MAX_CPU |         10 |       4  |
-| SCALE_UP_FACTOR        |          - |      1.5 |
-| SCALE_DOWN_FACTOR      |          - |     0.75 |
-| DOWNSCALE_BLOCK_TAIL   |        0.5 |      0.5 |
-| AGG                    |        max |        - |
-
-`p50_trend_pred` drives every scaling decision. `tail_trend_label` is
-recorded on every log line and used as a downscale-safety guard: the
-controller refuses to shrink while `tail > DOWNSCALE_BLOCK_TAIL`.
+| Env var                   | Default | Meaning                                                              |
+| ------------------------- | ------: | -------------------------------------------------------------------- |
+| `TICK_MS`                 |   `100` | per-pod policy evaluation cadence                                    |
+| `STALE_MS`                |  `1500` | a snapshot older than this is treated as missing                     |
+| `WINDOW_SIZE`             |    `20` | rolling-window samples (~2 s at 100 ms cadence)                      |
+| `HI_THRESHOLD`            |   `0.5` | what counts as "elevated" for PersistenceH / DurationAboveHiMs        |
+| `MIN_CPU` / `MAX_CPU`     |  `200m` / `4` | vertical resize clamp                                          |
+| `HORIZONTAL_COOLDOWN_SEC` |    `30` | cross-node Deployment scale gate                                     |
+| `TARGETS_CONFIG`          | `/etc/mitigation/targets.yaml` | mounted from the ConfigMap                          |
+| `POLICY_CONFIG`           | `/etc/mitigation/policy.yaml`  | same                                                |
+| `NODE_NAME`               |    (none) | required; injected via `fieldRef: spec.nodeName`                  |
 
 ## Deploy
 
 Prerequisite: K8s >= 1.35 (in-place pod resize GA -- see
-<https://kubernetes.io/blog/2025/12/19/kubernetes-v1-35-in-place-pod-resize-ga/>).
+<https://kubernetes.io/blog/2025/12/19/kubernetes-v1-35-in-place-pod-resize-ga/>),
+cgroup v2 on every node, and the
+`pod-security.kubernetes.io/enforce=privileged` namespace label is honoured
+(see `deploy/controller/namespace.yaml`).
 
 ### Sample victims
 
@@ -102,45 +187,39 @@ kubectl apply -f deploy/victim-sample/profile.yaml
 ```
 
 Replace the placeholder `image: REGISTRY/...:tag` lines with your real
-images. The container fields that matter for the mitigations to work:
-named `score` port 7900, `resources.requests == resources.limits`,
+images. The fields that matter for mitigations to work: named `score` port
+7900, `resources.requests == resources.limits`,
 `resizePolicy.cpu = NotRequired`.
 
-### Vertical scaler
+### Mitigation controller
 
 ```bash
-kubectl apply -f deploy/vertical/rbac.yaml
-kubectl apply -f deploy/vertical/configmap.yaml
-kubectl apply -f deploy/vertical/deployment.yaml
+kubectl apply -f deploy/controller/namespace.yaml
+kubectl apply -f deploy/controller/rbac.yaml
+kubectl apply -f deploy/controller/configmap.yaml
+kubectl apply -f deploy/controller/daemonset.yaml
 ```
 
-Adding a new victim service later is a single ConfigMap edit:
+Adding a victim service later = single ConfigMap edit:
 
 ```bash
-kubectl -n mitigation-system edit cm vertical-scaler-targets
-# kubectl rollout restart deploy/vertical-scaler -n mitigation-system  # optional
+kubectl -n mitigation-system edit cm mitigation-controller-config
+# Policy/targets reload via fsnotify within ~1s; no rollout needed.
 ```
 
-### Horizontal scaler
+## Crash-safe state (annotations only)
 
-Prerequisite: install the CPA operator
-([repo](https://github.com/jthomperoo/custom-pod-autoscaler-operator)):
+Every action stamps annotations on its target *before* the actual write so
+`Reconcile()` at startup can find and complete an interrupted apply:
 
-```bash
-VERSION=v1.4.0
-kubectl apply -f https://github.com/jthomperoo/custom-pod-autoscaler-operator/releases/download/${VERSION}/cluster.yaml
-```
+| Target               | Annotation keys                                                                              |
+| -------------------- | -------------------------------------------------------------------------------------------- |
+| Aggressor Pod        | `mitigation/cpu-max-original`, `mitigation/cpu-max-set-by-node`, `mitigation/cpu-max-set-at` |
+| Victim Pod           | `mitigation/cpu-limit-baseline`                                                              |
+| Victim Deployment    | `mitigation/horizontal-last-scaled-at`, `mitigation/horizontal-baseline-replicas`            |
 
-Then per victim:
-
-```bash
-kubectl apply -f deploy/horizontal/rbac.yaml
-kubectl apply -f deploy/horizontal/cpa-search.yaml
-kubectl apply -f deploy/horizontal/cpa-profile.yaml
-```
-
-Adding another victim = `cp cpa-search.yaml cpa-newvictim.yaml`, change
-`metadata.name`, `scaleTargetRef.name`, and `TARGET_SELECTOR`.
+No extra storage backend (etcd, Redis, the controller's own CRD) is needed;
+the API server is the source of truth.
 
 ## Smoke test the score API directly
 
@@ -155,15 +234,15 @@ grpcurl -plaintext -d '{}' localhost:7900 \
   gordion.contention.ContentionStream/Subscribe
 ```
 
-You should see a stream of `ScoreEvent` JSON objects at roughly 10 Hz.
+You should see a stream of `ScoreEvent` JSON objects at roughly 10 Hz, now
+including `p50_horizons` / `tail_horizons` / `horizon_ms` once the
+predictor side ships the matching change.
 
 ## Observability
 
-Both binaries log JSON to stderr via `log/slog`. Every action-decision log
-line carries `p50_agg`/`p50`, `tail_max`/`tail`, `dir`, `act`, the
-before/after value, and the reason if an action was suppressed (cooldown,
-tail safety, or pod-side infeasibility). No Prometheus exporter yet; that's
-deliberately out of scope for this pass.
+JSON `log/slog` on stderr. Every action emits a single line with
+`rule`, `kind`, `pod`, `node`, `applied`, `reason`, `before`, `after`, and
+`err` on failure. No Prometheus exporter yet; deliberately out of scope.
 
 ## Renaming the module
 

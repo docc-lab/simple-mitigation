@@ -28,4 +28,10 @@ message ScoreEvent {
   float  tail_trend_label = 5;   // [0, 1] -- p90/p99-combined tail trend
   string model_version    = 6;   // changes with each retrain
   string source_kind      = 7;   // "onnx" | "formula" | ...
+
+  // Multi-horizon spatial predictions (plan v2). Older predictors may leave
+  // these empty; consumers must degrade gracefully when len()==0.
+  repeated float p50_horizons  = 8;   // predictions at horizons indexed by horizon_ms
+  repeated float tail_horizons = 9;   // tail side, same indexing
+  repeated int32 horizon_ms    = 10;  // parallel array of horizon offsets in ms
 }

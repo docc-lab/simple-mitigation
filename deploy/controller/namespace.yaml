@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: mitigation-system
+  labels:
+    # Restrict the privileged DaemonSet to this namespace via Pod Security
+    # admission. The DaemonSet itself needs hostPID + privileged: true; the
+    # rest of the namespace is held to "baseline".
+    pod-security.kubernetes.io/enforce: privileged
+    pod-security.kubernetes.io/warn: baseline
+    pod-security.kubernetes.io/audit: baseline
