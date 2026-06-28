@@ -7,6 +7,7 @@ policy each tick, and fires one of three mitigation tiers:
 | Tier         | Surface                                        | Timescale | Actuator               |
 | ------------ | ---------------------------------------------- | --------: | ---------------------- |
 | `isolate`    | cgroup v2 `cpu.max` on co-located aggressors   |  ~100 ms  | `pkg/actuators/isolate`  |
+| `harvest`    | cgroup v2 `cpu.max` on co-located best-effort pods |  ~100 ms  | `pkg/actuators/harvest`  |
 | `vertical`   | `pods/resize` subresource (cpu requests/limits) |   ~1 s    | `pkg/actuators/vertical` |
 | `horizontal` | `apps/v1.Deployment/scale` subresource          |  ~10 s+   | `pkg/actuators/horizontal` |
 
@@ -27,11 +28,16 @@ See [`plan-v2-centralized.md`](plan-v2-centralized.md) for the full design.
                                                     ↓
                                             policy (CEL rules)
                                                     ↓
-                                ┌──────────────┬──────────────┐
-                                ▼              ▼              ▼
-                            isolate         vertical      horizontal
-                            (cpu.max)    (pods/resize) (deploy/scale)
+                                ┌──────────┬──────────┬──────────┐
+                                ▼          ▼          ▼          ▼
+                            isolate     harvest    vertical   horizontal
+                            (cpu.max)  (cpu.max)  (resize)   (scale)
 ```
+
+The simulation's three simple control laws (horizontal bang-bang, isolating
+saturated ramp, harvesting AIMD) are ported to `pkg/controllers` and validated
+against [`simulation/simulation.py`](simulation/simulation.py). They are not
+yet driving the per-tick loop — see [`plan.md`](plan.md) for the wiring status.
 
 ## Repo layout
 
@@ -45,9 +51,11 @@ pkg/features/                           rolling window + spatial/temporal featur
 pkg/policy/                             CEL env, YAML rule loader, fsnotify hot-reload, engine
 pkg/cgroup/                             cgroup v2 path resolution + cpu.max read/write
 pkg/actuators/                          shared interface + annotation key constants
-pkg/actuators/isolate/                  throttles aggressor pods' cpu.max
+pkg/actuators/isolate/                  throttles aggressor pods' cpu.max (fraction or absolute cap)
+pkg/actuators/harvest/                  raises best-effort pods' cpu.max to lend victim idle cores
 pkg/actuators/vertical/                 patches pods/resize for the victim pod
 pkg/actuators/horizontal/               patches deployments/scale for the victim Deployment
+pkg/controllers/                        the 3 simple control laws ported from simulation.py (cap / n / h)
 pkg/aggregator/                         pluggable Max / Mean / P90 (callable from rules)
 pkg/thresholder/                        HI/LO + cooldown state machine (also exposed to CEL via `band`)
 cmd/mitigation-controller/              the only binary
@@ -76,6 +84,67 @@ make docker-controller
 
 The Dockerfile runs `make proto` inside the build stage, so `docker build`
 works from a fresh clone.
+
+## Test
+
+Three layers: Go unit tests, the offline control-law parity oracle, and an
+in-cluster smoke test.
+
+### Go unit tests
+
+```bash
+make test                          # go test ./... (all packages)
+go test ./pkg/controllers/...      # the 3 ported control laws + streaming parity
+go test ./pkg/cgroup/...           # cpu.max parse / path resolution
+go test ./pkg/policy/...           # CEL compile + cooldown engine
+```
+
+`make test` needs the generated proto stubs (`make proto` once after a fresh
+clone) because several packages import `gen/go/contentionpb`.
+`pkg/controllers` has no proto dependency, so it tests standalone even before
+`make proto`.
+
+### Control-law parity (offline)
+
+[`simulation/simulation.py`](simulation/simulation.py) is the reference
+implementation the Go controllers in `pkg/controllers` are validated against —
+the test expectations in `pkg/controllers/controllers_test.go` were
+cross-checked against it. Run it to regenerate the sweep/figure PNGs or to
+re-derive expected values:
+
+```bash
+cd simulation
+pip install numpy scipy matplotlib            # one-time
+python simulation.py                          # synthetic signals -> *.png
+python simulation.py --data run_data_iter1_ready.json   # against a real Gordion trace
+```
+
+It writes `sweep_horizontal.png`, `sweep_isolating.png`, `sweep_harvesting.png`,
+and `ctrl_reference_run.png`, plus a numeric summary to stdout.
+
+### In-cluster smoke test
+
+After [deploying](#deploy), confirm the pipeline end to end:
+
+```bash
+# controller is up, one pod per node, and loaded the policy:
+kubectl -n mitigation-system rollout status ds/mitigation-controller
+kubectl -n mitigation-system logs -l app=mitigation-controller --tail=20 | grep "policy reloaded"
+
+# drive contention on a victim, then watch actions fire:
+kubectl -n mitigation-system logs -l app=mitigation-controller -f | grep '"msg":"action"'
+
+# verify a cgroup write landed on an aggressor (isolate) / best-effort pod (harvest):
+kubectl -n hotelres get pod <aggressor> -o jsonpath='{.metadata.annotations.mitigation/cpu-max-original}'
+kubectl -n hotelres get pod <be-pod>     -o jsonpath='{.metadata.annotations.mitigation/harvest-cpu-max-original}'
+```
+
+You can also exercise the score API alone without the controller — see
+[Smoke test the score API directly](#smoke-test-the-score-api-directly).
+
+> Note: this repo's CI/dev machine may not have a Go toolchain installed; if
+> `go` is missing, the parity oracle (Python) still runs and is the primary
+> way control-law changes are validated before pushing.
 
 ## Default policy (out of the box)
 
@@ -144,6 +213,20 @@ Two helper functions are registered:
 
 - `band(score, lo, hi) string` -> `"up"` / `"down"` / `"stable"`
 - `count_at_least(list, threshold) int` -> count of list entries `>= threshold`
+
+### Actuator params (`fire[].kind` + `params`)
+
+| kind         | params                                                                                  |
+| ------------ | --------------------------------------------------------------------------------------- |
+| `isolate`    | `aggressor_selector` (req), and **either** `throttle_fraction` (default 0.5, one-shot) **or** absolute-cap mode: `cap_cores` / `cpu_max_quota_us` (+ `period_us`, `min_quota_us`). Optional `aggressor_namespace`. |
+| `harvest`    | `be_selector` (req), `harvest_cores` (req, cores to lend on top of baseline). Optional `be_namespace`, `period_us`, `max_quota_us`. |
+| `vertical`   | `scale_factor` (multiplicative) **or** `target_cpu` (absolute, e.g. `"750m"`). Clamped to `MIN_CPU`/`MAX_CPU`. |
+| `horizontal` | exactly one of `delta` (additive) or `ensure_min` (idempotent floor); optional `min_replicas`/`max_replicas`. |
+| `restore`    | meta-kind; fans out to every actuator's `Restore()`. |
+
+The absolute-cap mode on `isolate` and the `harvest` kind are the actuation
+surfaces the simulation's isolating (`cap`) and harvesting (`h`) controllers
+drive; see [`plan.md`](plan.md).
 
 ### Authoring workflow
 
@@ -215,6 +298,7 @@ Every action stamps annotations on its target *before* the actual write so
 | Target               | Annotation keys                                                                              |
 | -------------------- | -------------------------------------------------------------------------------------------- |
 | Aggressor Pod        | `mitigation/cpu-max-original`, `mitigation/cpu-max-set-by-node`, `mitigation/cpu-max-set-at` |
+| Best-effort Pod      | `mitigation/harvest-cpu-max-original`, `mitigation/harvest-set-by-node`, `mitigation/harvest-set-at` |
 | Victim Pod           | `mitigation/cpu-limit-baseline`                                                              |
 | Victim Deployment    | `mitigation/horizontal-last-scaled-at`, `mitigation/horizontal-baseline-replicas`            |
 
