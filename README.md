@@ -129,10 +129,10 @@ After [deploying](#deploy), confirm the pipeline end to end:
 ```bash
 # controller is up, one pod per node, and loaded the policy:
 kubectl -n mitigation-system rollout status ds/mitigation-controller
-kubectl -n mitigation-system logs -l app=mitigation-controller --tail=20 | grep "policy reloaded"
+kubectl -n mitigation-system logs -l app.kubernetes.io/name=mitigation-controller --tail=20 | grep "policy reloaded"
 
 # drive contention on a victim, then watch actions fire:
-kubectl -n mitigation-system logs -l app=mitigation-controller -f | grep '"msg":"action"'
+kubectl -n mitigation-system logs -l app.kubernetes.io/name=mitigation-controller -f | grep '"msg":"action"'
 
 # verify a cgroup write landed on an aggressor (isolate) / best-effort pod (harvest):
 kubectl -n hotelres get pod <aggressor> -o jsonpath='{.metadata.annotations.mitigation/cpu-max-original}'
@@ -276,11 +276,30 @@ images. The fields that matter for mitigations to work: named `score` port
 
 ### Mitigation controller
 
+First make the image reachable by the cluster. `make docker-controller` builds
+`simple-mitigation/mitigation-controller:dev` into the local **Docker** daemon,
+but most clusters run **containerd**, which is a separate image store. Import it
+into containerd's `k8s.io` namespace on **every node**:
+
+```bash
+docker save simple-mitigation/mitigation-controller:dev -o /tmp/mc.tar
+sudo ctr -n k8s.io images import /tmp/mc.tar
+sudo ctr -n k8s.io images ls | grep mitigation   # docker.io/simple-mitigation/mitigation-controller:dev
+```
+
+(For a real registry instead, set the `image:` in `daemonset.yaml` to
+`<registry>/simple-mitigation/mitigation-controller:<tag>` and `docker push`.)
+
+Then apply, in order:
+
 ```bash
 kubectl apply -f deploy/controller/namespace.yaml
 kubectl apply -f deploy/controller/rbac.yaml
 kubectl apply -f deploy/controller/configmap.yaml
 kubectl apply -f deploy/controller/daemonset.yaml
+
+kubectl -n mitigation-system rollout status ds/mitigation-controller
+kubectl -n mitigation-system logs -l app.kubernetes.io/name=mitigation-controller --tail=30
 ```
 
 Adding a victim service later = single ConfigMap edit:

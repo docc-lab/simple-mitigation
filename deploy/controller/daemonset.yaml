@@ -33,7 +33,11 @@ spec:
           effect: NoExecute
       containers:
         - name: mitigation-controller
-          image: REGISTRY/simple-mitigation/mitigation-controller:dev
+          # Local dev tag built by `make docker-controller`. For a real
+          # registry, change this to <registry>/simple-mitigation/mitigation-controller:<tag>
+          # and push. With the local tag, the image must be present in each
+          # node's container runtime (see README "Load the image" step).
+          image: simple-mitigation/mitigation-controller:dev
           imagePullPolicy: IfNotPresent
           securityContext:
             privileged: true
