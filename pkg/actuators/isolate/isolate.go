@@ -19,6 +19,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"math"
 	"time"
 
 	"github.com/coding-workspace/simple-mitigation-1/pkg/actuators"
@@ -67,21 +68,28 @@ func (a *Actuator) Name() string { return "isolate" }
 // Recognised params:
 //
 //	aggressor_selector: string  comma-separated key=value labels (REQUIRED)
-//	throttle_fraction: float    fraction of original quota to keep (default 0.5)
 //	aggressor_namespace: string optional namespace filter; defaults to target's namespace
 //
-// "Throttled" means the new quota = round(throttle_fraction * original_quota).
-// Pods whose original cpu.max is "max" (unbounded) are throttled to
-// throttle_fraction * period -- i.e. a single CPU's worth scaled by the
-// fraction -- because there's no quota baseline to multiply.
+// Two target-quota modes (see buildMode):
+//
+//	throttle_fraction: float    fraction of original quota to keep (default 0.5)
+//	cap_cores: float            absolute core cap -> quota = round(cap_cores*period)
+//	cpu_max_quota_us: int       absolute quota in microseconds (overrides cap_cores)
+//	period_us: int              period for absolute mode (default: pod's current period)
+//	min_quota_us: int           floor for absolute quota (default 1000)
+//
+// Fraction mode (the default) is one-shot per pod and never raises quota.
+// Absolute mode (cap_cores / cpu_max_quota_us) is what the isolating
+// controller's proportional ramp uses: it re-applies every call and may raise
+// quota as contention releases, tracking cap back up toward baseline.
 func (a *Actuator) Apply(ctx context.Context, target actuators.Target, params map[string]any) (actuators.ActionResult, error) {
 	selStr, _ := params["aggressor_selector"].(string)
 	if selStr == "" {
 		return actuators.ActionResult{}, fmt.Errorf("isolate: aggressor_selector param required")
 	}
-	fraction := paramFloat(params, "throttle_fraction", 0.5)
-	if fraction <= 0 || fraction >= 1 {
-		return actuators.ActionResult{}, fmt.Errorf("isolate: throttle_fraction must be in (0,1), got %v", fraction)
+	m, err := buildMode(params)
+	if err != nil {
+		return actuators.ActionResult{}, err
 	}
 	ns := target.Spec.Namespace
 	if v, ok := params["aggressor_namespace"].(string); ok && v != "" {
@@ -103,28 +111,32 @@ func (a *Actuator) Apply(ctx context.Context, target actuators.Target, params ma
 	}
 
 	var applied int
-	throttled := make([]string, 0, len(pods.Items))
+	touched := make([]string, 0, len(pods.Items))
 	var firstErr error
 	for i := range pods.Items {
 		pod := &pods.Items[i]
-		ok, err := a.throttlePod(ctx, pod, fraction)
+		ok, err := a.applyPod(ctx, pod, m)
 		if err != nil {
 			if firstErr == nil {
 				firstErr = err
 			}
-			a.logger.Warn("isolate: throttle failed; continuing other aggressors",
+			a.logger.Warn("isolate: apply failed; continuing other aggressors",
 				"pod", pod.Name, "err", err)
 			continue
 		}
 		if ok {
 			applied++
-			throttled = append(throttled, pod.Name)
+			touched = append(touched, pod.Name)
 		}
+	}
+	after := map[string]any{"changed_pods": touched}
+	for k, v := range m.after {
+		after[k] = v
 	}
 	res := actuators.ActionResult{
 		Applied: applied > 0,
-		Reason:  fmt.Sprintf("throttled %d/%d aggressors", applied, len(pods.Items)),
-		After:   map[string]any{"throttled_pods": throttled, "throttle_fraction": fraction},
+		Reason:  fmt.Sprintf("applied %d/%d aggressors", applied, len(pods.Items)),
+		After:   after,
 	}
 	if firstErr != nil && applied == 0 {
 		return res, firstErr
@@ -132,10 +144,80 @@ func (a *Actuator) Apply(ctx context.Context, target actuators.Target, params ma
 	return res, nil
 }
 
-// throttlePod throttles a single aggressor pod's first container's cgroup.
-// Returns (true, nil) on a successful write; (false, nil) when the pod was
-// already at or below the target quota; (false, err) on failure.
-func (a *Actuator) throttlePod(ctx context.Context, pod *corev1.Pod, fraction float64) (bool, error) {
+// mode describes how Apply computes and writes the target cpu.max for each
+// matched aggressor.
+//
+//   - fraction (default): target quota = throttle_fraction * original. Never
+//     raises quota; applied once per pod (skipped while our annotation holds).
+//   - absolute: target quota from cap_cores / cpu_max_quota_us. Used by the
+//     isolating controller's proportional ramp, which both lowers and raises
+//     the cap as contention changes, so it may raise quota and is re-applied
+//     every call.
+type mode struct {
+	compute    func(current cgroup.CPUMax) cgroup.CPUMax
+	allowRaise bool
+	reapply    bool
+	after      map[string]any
+}
+
+// buildMode selects fraction vs absolute mode from the rule params.
+func buildMode(params map[string]any) (mode, error) {
+	capCores, hasCap := paramFloatOK(params, "cap_cores")
+	quotaUs, hasQuota := paramFloatOK(params, "cpu_max_quota_us")
+	if hasCap || hasQuota {
+		minQuota := int64(paramFloat(params, "min_quota_us", 1000))
+		periodParam := int64(paramFloat(params, "period_us", 0))
+		after := map[string]any{}
+		if hasCap {
+			after["cap_cores"] = capCores
+		}
+		if hasQuota {
+			after["cpu_max_quota_us"] = int64(quotaUs)
+		}
+		return mode{
+			allowRaise: true,
+			reapply:    true,
+			after:      after,
+			compute: func(current cgroup.CPUMax) cgroup.CPUMax {
+				period := periodParam
+				if period <= 0 {
+					period = current.Period
+				}
+				if period <= 0 {
+					period = 100_000
+				}
+				var quota int64
+				if hasQuota {
+					quota = int64(quotaUs)
+				} else {
+					quota = int64(math.Round(capCores * float64(period)))
+				}
+				if quota < minQuota {
+					quota = minQuota
+				}
+				return cgroup.CPUMax{Quota: quota, Period: period}
+			},
+		}, nil
+	}
+	fraction := paramFloat(params, "throttle_fraction", 0.5)
+	if fraction <= 0 || fraction >= 1 {
+		return mode{}, fmt.Errorf("isolate: throttle_fraction must be in (0,1), got %v", fraction)
+	}
+	return mode{
+		allowRaise: false,
+		reapply:    false,
+		after:      map[string]any{"throttle_fraction": fraction},
+		compute: func(current cgroup.CPUMax) cgroup.CPUMax {
+			return computeThrottled(current, fraction)
+		},
+	}, nil
+}
+
+// applyPod computes the target cpu.max for one aggressor pod and writes it if
+// it differs from the current value. Returns (true, nil) on a successful
+// write; (false, nil) on a no-op (already set in fraction mode, would raise
+// quota when not allowed, or target == current); (false, err) on failure.
+func (a *Actuator) applyPod(ctx context.Context, pod *corev1.Pod, m mode) (bool, error) {
 	cs := primaryContainerStatus(pod)
 	if cs == nil || cs.ContainerID == "" {
 		return false, fmt.Errorf("no running container with ID")
@@ -145,8 +227,9 @@ func (a *Actuator) throttlePod(ctx context.Context, pod *corev1.Pod, fraction fl
 		return false, fmt.Errorf("resolve cgroup: %w", err)
 	}
 
-	// If we've already throttled this pod and the annotation is intact, leave it.
-	if v, ok := pod.Annotations[actuators.AnnAggressorSetByNode]; ok && v == a.nodeName {
+	alreadySet := pod.Annotations[actuators.AnnAggressorSetByNode] == a.nodeName
+	// Fraction mode is one-shot: once our annotation holds, leave it alone.
+	if alreadySet && !m.reapply {
 		return false, nil
 	}
 
@@ -154,28 +237,33 @@ func (a *Actuator) throttlePod(ctx context.Context, pod *corev1.Pod, fraction fl
 	if err != nil {
 		return false, fmt.Errorf("read cpu.max: %w", err)
 	}
-	throttled := computeThrottled(current, fraction)
-	if throttled.Quota >= 0 && current.Quota >= 0 && throttled.Quota >= current.Quota {
+	target := m.compute(current)
+	if !m.allowRaise && target.Quota >= 0 && current.Quota >= 0 && target.Quota >= current.Quota {
 		// Don't increase quota under the "throttle" name.
 		return false, nil
 	}
-
-	// Stamp annotations first so a crash mid-write leaves us a trail for
-	// Reconcile to follow. Order matters: original-value before set-by-node.
-	if err := a.annotatePod(ctx, pod, map[string]string{
-		actuators.AnnAggressorCPUMaxOriginal: current.String(),
-		actuators.AnnAggressorSetByNode:      a.nodeName,
-		actuators.AnnAggressorSetAt:          time.Now().UTC().Format(time.RFC3339),
-	}); err != nil {
-		return false, fmt.Errorf("annotate: %w", err)
+	if target == current {
+		return false, nil
 	}
-	if err := a.resolver.WriteCPUMax(dir, throttled); err != nil {
+
+	// Record the original cpu.max once, the first time this node touches the
+	// pod, so Restore/Reconcile have a baseline. Order matters: original-value
+	// before set-by-node, so a crash mid-write leaves Reconcile a trail.
+	if !alreadySet {
+		if err := a.annotatePod(ctx, pod, map[string]string{
+			actuators.AnnAggressorCPUMaxOriginal: current.String(),
+			actuators.AnnAggressorSetByNode:      a.nodeName,
+			actuators.AnnAggressorSetAt:          time.Now().UTC().Format(time.RFC3339),
+		}); err != nil {
+			return false, fmt.Errorf("annotate: %w", err)
+		}
+	}
+	if err := a.resolver.WriteCPUMax(dir, target); err != nil {
 		return false, fmt.Errorf("write cpu.max: %w", err)
 	}
-	a.logger.Info("isolate: throttled",
+	a.logger.Info("isolate: applied",
 		"pod", pod.Name, "ns", pod.Namespace,
-		"from", current.String(), "to", throttled.String(),
-		"fraction", fraction)
+		"from", current.String(), "to", target.String())
 	return true, nil
 }
 
@@ -381,26 +469,35 @@ func stringMapToAnyMap(in map[string]string) map[string]any {
 }
 
 func paramFloat(params map[string]any, key string, def float64) float64 {
-	if v, ok := params[key]; ok {
-		switch x := v.(type) {
-		case float64:
-			return x
-		case float32:
-			return float64(x)
-		case int:
-			return float64(x)
-		case int64:
-			return float64(x)
-		case string:
-			// Accept "0.5" literals from YAML rule authors who quoted.
-			var f float64
-			_, err := fmt.Sscanf(x, "%f", &f)
-			if err == nil {
-				return f
-			}
-		}
+	if f, ok := paramFloatOK(params, key); ok {
+		return f
 	}
 	return def
+}
+
+// paramFloatOK reports whether key is present and coerces it to float64.
+func paramFloatOK(params map[string]any, key string) (float64, bool) {
+	v, ok := params[key]
+	if !ok {
+		return 0, false
+	}
+	switch x := v.(type) {
+	case float64:
+		return x, true
+	case float32:
+		return float64(x), true
+	case int:
+		return float64(x), true
+	case int64:
+		return float64(x), true
+	case string:
+		// Accept quoted numeric literals from YAML rule authors.
+		var f float64
+		if _, err := fmt.Sscanf(x, "%f", &f); err == nil {
+			return f, true
+		}
+	}
+	return 0, false
 }
 
 // Compile-time interface check.

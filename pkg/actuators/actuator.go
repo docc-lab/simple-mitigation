@@ -72,6 +72,14 @@ const (
 	AnnAggressorSetByNode      = "mitigation/cpu-max-set-by-node"
 	AnnAggressorSetAt          = "mitigation/cpu-max-set-at"
 
+	// Harvest annotations live on the best-effort pod the harvester lends
+	// idle cores to. Kept distinct from the aggressor keys so a pod could in
+	// principle be both throttled (as an aggressor) and granted (as BE)
+	// without the two actuators clobbering each other's baseline.
+	AnnHarvestCPUMaxOriginal = "mitigation/harvest-cpu-max-original"
+	AnnHarvestSetByNode      = "mitigation/harvest-set-by-node"
+	AnnHarvestSetAt          = "mitigation/harvest-set-at"
+
 	AnnVictimCPULimitBaseline = "mitigation/cpu-limit-baseline"
 
 	AnnDeployHorizLastScaledAt = "mitigation/horizontal-last-scaled-at"
