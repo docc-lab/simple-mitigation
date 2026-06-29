@@ -292,6 +292,17 @@ applies all four manifests, and waits for rollout — **the tracked manifest is
 left untouched**, so `git pull` never conflicts. The manual steps below are the
 same thing unpacked.
 
+**Turn it off + revert:** [`mitigation-off.sh`](mitigation-off.sh) stops the
+controller and undoes anything it changed — scales Deployments back to their
+baseline replicas and recreates any pods whose `cpu.max` was modified
+(isolate/harvest) so they restart clean:
+
+```bash
+./mitigation-off.sh --dry-run    # preview what would be reverted
+./mitigation-off.sh              # stop + revert
+./mitigation-off.sh --purge      # also delete the namespace + cluster RBAC
+```
+
 First make the image reachable by **every node** (the DaemonSet runs one pod
 per node). `make docker-controller` builds
 `simple-mitigation/mitigation-controller:dev` into the local image store of the
