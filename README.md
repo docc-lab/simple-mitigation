@@ -172,7 +172,7 @@ rules:
     priority: 50
 
   - name: clean_state
-    when: "p50_now < 0.2 && k_temporal < 0 && tail_now < 0.5"
+    when: "p50_now < 0.2 && k_temporal < 0.0 && tail_now < 0.5"
     fire:
       - kind: restore
         params: { tier: all }
@@ -276,19 +276,49 @@ images. The fields that matter for mitigations to work: named `score` port
 
 ### Mitigation controller
 
-First make the image reachable by the cluster. `make docker-controller` builds
-`simple-mitigation/mitigation-controller:dev` into the local **Docker** daemon,
-but most clusters run **containerd**, which is a separate image store. Import it
-into containerd's `k8s.io` namespace on **every node**:
+**Automated (recommended):** [`build-push-deploy.sh`](build-push-deploy.sh)
+does build → push → manifest rewrite → apply → rollout in one shot:
 
 ```bash
+./build-push-deploy.sh --node=node-3                 # build, push to docclabgroup, deploy pinned to node-3
+./build-push-deploy.sh --tag=v2 --node=node-3        # custom tag
+./build-push-deploy.sh --no-build --node=node-3      # redeploy the current pushed image
+./build-push-deploy.sh --help                        # all options (registry, pull-policy, no-push, ...)
+```
+
+It rewrites `deploy/controller/daemonset.yaml`'s image/pull-policy (and pins the
+DaemonSet to `--node` via `nodeSelector`), then applies all four manifests and
+waits for rollout. The manual steps below are the same thing unpacked.
+
+First make the image reachable by **every node** (the DaemonSet runs one pod
+per node). `make docker-controller` builds
+`simple-mitigation/mitigation-controller:dev` into the local image store of the
+node you built on; the others need it too. Check your runtime with
+`kubectl get nodes -o wide` (CONTAINER-RUNTIME column):
+
+```bash
+# Save once on the build node:
 docker save simple-mitigation/mitigation-controller:dev -o /tmp/mc.tar
+
+# --- containerd runtime: import into the k8s.io namespace on each node ---
 sudo ctr -n k8s.io images import /tmp/mc.tar
-sudo ctr -n k8s.io images ls | grep mitigation   # docker.io/simple-mitigation/mitigation-controller:dev
+sudo ctr -n k8s.io images ls | grep mitigation
+
+# --- docker runtime: load on each node (e.g. fan out over SSH) ---
+for n in node-1 node-2 node-3 node-4; do
+  scp /tmp/mc.tar "$n:/tmp/mc.tar" && ssh "$n" 'docker load -i /tmp/mc.tar'
+done
 ```
 
 (For a real registry instead, set the `image:` in `daemonset.yaml` to
-`<registry>/simple-mitigation/mitigation-controller:<tag>` and `docker push`.)
+`<registry>/simple-mitigation/mitigation-controller:<tag>` and `docker push` —
+then no per-node loading is needed.)
+
+> Version note: this design targets K8s >= 1.35 (in-place `pods/resize` GA). On
+> older clusters the controller still runs and `isolate` / `harvest` /
+> `horizontal` work, but the `vertical` actuator needs `pods/resize` (alpha
+> 1.27, beta 1.33, GA 1.35) and will error there — drop the `vertical` fire
+> from the policy on pre-1.33 clusters.
 
 Then apply, in order:
 

@@ -48,7 +48,7 @@ data:
         priority: 50
 
       - name: clean_state
-        when: "p50_now < 0.2 && k_temporal < 0 && tail_now < 0.5"
+        when: "p50_now < 0.2 && k_temporal < 0.0 && tail_now < 0.5"
         fire:
           - kind: restore
             params:
