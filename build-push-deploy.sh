@@ -115,33 +115,37 @@ if [ "$DO_DEPLOY" = false ]; then
   exit 0
 fi
 
-# ---- Phase 3: rewrite manifest ---------------------------------------------
-log_info "Phase 3: updating ${DS_YAML}"
+# ---- Phase 3: render manifest (leaves the tracked file untouched) ----------
+# Render to a temp copy so the committed daemonset.yaml stays clean and
+# `git pull` never conflicts with deploy-time image/node/pull-policy edits.
+log_info "Phase 3: rendering ${DS_YAML} -> temp manifest"
 [ -f "$DS_YAML" ] || { log_error "manifest not found: $DS_YAML"; exit 1; }
-cp "$DS_YAML" "${DS_YAML}.backup"
+RENDERED_DS="$(mktemp "${TMPDIR:-/tmp}/mc-daemonset.XXXXXX.yaml")"
+trap 'rm -f "$RENDERED_DS"' EXIT
+cp "$DS_YAML" "$RENDERED_DS"
 
 # Image line: replace whatever is there (placeholder or a previous value).
-sed -i "/^[[:space:]]*image:/s|image:.*|image: ${FULL_IMAGE}|" "$DS_YAML"
+sed -i "/^[[:space:]]*image:/s|image:.*|image: ${FULL_IMAGE}|" "$RENDERED_DS"
 # Pull policy.
-sed -i "s|imagePullPolicy:.*|imagePullPolicy: ${PULL_POLICY}|" "$DS_YAML"
+sed -i "s|imagePullPolicy:.*|imagePullPolicy: ${PULL_POLICY}|" "$RENDERED_DS"
 
 # Node pin (idempotent): set/insert nodeSelector: kubernetes.io/hostname.
 if [ -n "$NODE" ]; then
-  if grep -qE 'kubernetes\.io/hostname:' "$DS_YAML"; then
-    sed -i "s|kubernetes.io/hostname:.*|kubernetes.io/hostname: ${NODE}|" "$DS_YAML"
+  if grep -qE 'kubernetes\.io/hostname:' "$RENDERED_DS"; then
+    sed -i "s|kubernetes.io/hostname:.*|kubernetes.io/hostname: ${NODE}|" "$RENDERED_DS"
   else
-    sed -i "/serviceAccountName: ${DS_NAME}/a\\      nodeSelector:\n        kubernetes.io/hostname: ${NODE}" "$DS_YAML"
+    sed -i "/serviceAccountName: ${DS_NAME}/a\\      nodeSelector:\n        kubernetes.io/hostname: ${NODE}" "$RENDERED_DS"
   fi
 fi
 
-grep -E 'image:|imagePullPolicy:|hostname:' "$DS_YAML" || true
+grep -E 'image:|imagePullPolicy:|hostname:' "$RENDERED_DS" || true
 
 # ---- Phase 4: apply --------------------------------------------------------
 log_info "Phase 4: applying manifests"
 kubectl apply -f "${DEPLOY_DIR}/namespace.yaml"
 kubectl apply -f "${DEPLOY_DIR}/rbac.yaml"
 kubectl apply -f "${DEPLOY_DIR}/configmap.yaml"
-kubectl apply -f "$DS_YAML"
+kubectl apply -f "$RENDERED_DS"
 
 # Force a fresh pull/restart so a re-pushed mutable tag is actually picked up.
 log_info "Restarting DaemonSet to pick up the image"

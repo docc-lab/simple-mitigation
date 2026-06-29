@@ -286,9 +286,11 @@ does build → push → manifest rewrite → apply → rollout in one shot:
 ./build-push-deploy.sh --help                        # all options (registry, pull-policy, no-push, ...)
 ```
 
-It rewrites `deploy/controller/daemonset.yaml`'s image/pull-policy (and pins the
-DaemonSet to `--node` via `nodeSelector`), then applies all four manifests and
-waits for rollout. The manual steps below are the same thing unpacked.
+It renders a temp copy of `deploy/controller/daemonset.yaml` with the
+image/pull-policy set (and pins the DaemonSet to `--node` via `nodeSelector`),
+applies all four manifests, and waits for rollout — **the tracked manifest is
+left untouched**, so `git pull` never conflicts. The manual steps below are the
+same thing unpacked.
 
 First make the image reachable by **every node** (the DaemonSet runs one pod
 per node). `make docker-controller` builds
