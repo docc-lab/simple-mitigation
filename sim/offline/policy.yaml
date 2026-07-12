@@ -1,0 +1,38 @@
+# Offline policy for replayed Gordion traces (kgop-anchored: baseline ~0.03,
+# mildA ~0.49, mildB ~0.61, mildC ~0.70, moderate ~0.76, severe ~0.78 on p50;
+# tail runs ~0.05 lower through the milds).
+#
+# TEMPORAL FEATURES ONLY: replayed ScoreEvents have no horizon arrays, so
+# spatial features (persistence_h, k_spatial) are always zero here — a rule
+# gating on them would never fire.
+#
+# Run with HI_THRESHOLD=0.55 so duration_above_hi_ms matches the horizontal
+# rule's p50 threshold.
+rules:
+  - name: isolate_rising_tail
+    when: "tail_now > 0.65 || k_temporal > 0.5"
+    fire:
+      - kind: isolate
+        params:
+          throttle_fraction: 0.5
+          aggressor_selector: "tier=batch"
+    cooldown: "10s"
+    priority: 100
+
+  - name: scale_out_sustained_p50
+    when: "p50_now > 0.55 && duration_above_hi_ms >= 2000"
+    fire:
+      - kind: horizontal
+        params:
+          delta: 1
+    cooldown: "15s"
+    priority: 50
+
+  - name: restore_when_clean
+    when: "p50_now < 0.15 && tail_now < 0.3"
+    fire:
+      - kind: restore
+        params:
+          tier: all
+    cooldown: "30s"
+    priority: 10

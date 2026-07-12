@@ -1,0 +1,9 @@
+# Offline-mode targets: one entry per replayed trace. namespace/selector are
+# unused offline (no podwatch) but must be present for schema validation.
+targets:
+  - name: search
+    namespace: offline
+    selector:
+      app.kubernetes.io/name: search
+    scorePort: 7900
+    containerName: search

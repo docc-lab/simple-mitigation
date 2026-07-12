@@ -10,3 +10,8 @@ vendor/
 .vscode/
 *.swp
 *.swo
+
+# simulation inputs/outputs (local only)
+simulation/data/
+simulation/results/
+__pycache__/

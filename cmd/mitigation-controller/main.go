@@ -106,14 +106,27 @@ func main() {
 		os.Exit(2)
 	}
 
+	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer cancel()
+
+	// Offline mode: no kube client, no podwatch, dry-run actuators. The
+	// pipeline from gRPC subscribe through CEL dispatch is unchanged.
+	if raw := os.Getenv("OFFLINE_ADDRS"); raw != "" {
+		addrs, err := parseOfflineAddrs(raw)
+		if err != nil {
+			logger.Error("offline", "err", err)
+			os.Exit(2)
+		}
+		logger.Info("OFFLINE mode: dry-run actuators, static score addresses", "addrs", raw)
+		runOffline(ctx, cfg, tcfg, engine, logger, addrs)
+		return
+	}
+
 	kclient, err := newKubeClient()
 	if err != nil {
 		logger.Error("kube client", "err", err)
 		os.Exit(2)
 	}
-
-	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer cancel()
 
 	// Build actuators.
 	verticalAct, err := vertical.New(kclient, vertical.Config{

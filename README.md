@@ -112,15 +112,52 @@ the test expectations in `pkg/controllers/controllers_test.go` were
 cross-checked against it. Run it to regenerate the sweep/figure PNGs or to
 re-derive expected values:
 
+Raw score-curve JSON lives in `simulation/data/`; all generated figures land
+in `simulation/results/`. Paths resolve relative to the script, so it can be
+run from any directory. **Full usage reference:
+[`simulation/README.md`](simulation/README.md).**
+
 ```bash
-cd simulation
 pip install numpy scipy matplotlib            # one-time
-python simulation.py                          # synthetic signals -> *.png
-python simulation.py --data run_data_iter1_ready.json   # against a real Gordion trace
+cd simulation
+python simulation.py                          # synthetic signals -> results/*.png
+python simulation.py --data run_data_iter1_ready.json   # real trace (found in data/)
+python simulation.py --compare                # one score (kg) across arms
+python simulation.py --compare-scores         # all scores on the same arm, per-arm figures
 ```
 
-It writes `sweep_horizontal.png`, `sweep_isolating.png`, `sweep_harvesting.png`,
-and `ctrl_reference_run.png`, plus a numeric summary to stdout.
+Data files follow `data/{arm}_{score}_sim.json` — arm = experiment
+(baseline, mildA..C, moderate, severe), score = scoring algorithm (binary,
+ci, cpi, kg, rolling_pctl, slowdown_ratio); spike/staircase are stitched
+traces with no score suffix.
+
+Single-run mode writes `results/sweep_{horizontal,isolating,harvesting}.png`
+and `results/ctrl_reference_run.png`, plus a numeric summary to stdout.
+
+Both comparison modes run the two finalized controllers — horizontal
+bang-bang (Eq. 1) and isolation saturated-proportional (Eq. 2):
+
+- `--compare [files...]` — across arms for one score (default kg +
+  spike/staircase) → `results/compare_horizontal.png`,
+  `results/compare_isolating.png`.
+- `--compare-scores [arms...]` — across scores on the same arm →
+  `results/compare_scores_<arm>.png` per arm (score inputs, per-score n(t)
+  strips, cap overlay).
+
+`--scale` brings scores with different native magnitudes onto a common
+[0,1] range with a pure gain — `scaled(t) = k·s(t)`, no offset. Per score,
+the p50 series (Eq. 1 signal) and the p90 series (Eq. 2 signal) each get
+their own `k = min(1, 1/max(series over all arms))`: the smallest
+correction that pulls an out-of-range series back into [0,1], while a
+series already inside [0,1] keeps k = 1 and is untouched. The gains used
+are printed as `[gain]` lines and outputs get a `_scaled` filename suffix.
+(This is figure-side magnitude alignment only — not related to the
+normalization steps inside the scoring algorithms.)
+
+Every parameter of the two formulas is a flag (defaults in parentheses):
+Eq. (1) — `--theta-on` (0.3), `--theta-off` (0.1), `--n-max` (10),
+`--h-horz` lead time in seconds (1.0); Eq. (2) — `--theta-ref` (0.3),
+`--k-p` cores per unit score (6.4), `--cap-base` (4.0), `--cap-min` (0.5).
 
 ### In-cluster smoke test
 
