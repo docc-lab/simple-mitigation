@@ -72,7 +72,7 @@ type runtimeConfig struct {
 	// Eq. (1)/(2) control laws instead of CEL dispatch. See formula.go.
 	formula *formulaConfig
 	// scoreTrace, when SCORE_TRACE names a file, receives one CSV row per
-	// replica per tick: unix_ms,target,pod,p50,e_iso,n,applied_cap.
+	// replica per tick: unix_ms,target,pod,yhat50,y50,y90,ext90,e_iso,n,applied_cap.
 	scoreTrace *os.File
 }
 
@@ -232,7 +232,7 @@ func loadConfig() (*runtimeConfig, error) {
 			return nil, fmt.Errorf("SCORE_TRACE: %w", err)
 		}
 		if st, _ := f.Stat(); st != nil && st.Size() == 0 {
-			fmt.Fprintln(f, "unix_ms,target,pod,p50,e_iso,n,applied_cap")
+			fmt.Fprintln(f, "unix_ms,target,pod,yhat50,y50,y90,ext90,e_iso,n,applied_cap")
 		}
 		scoreTrace = f
 	}

@@ -9,19 +9,20 @@
 //	          ⎩  0  otherwise
 //	n(t+1) = min(n_max, max(0, n(t) + u_horz(t)))
 //
-// Online realization: the stream carries one predicted value per tick
-// (p50_trend_pred). It stands in for BOTH ŷ50 and y50 — the wire contract
-// has no separate "current observed" field. ŷ50 is aggregated to service
-// level as the mean over healthy replicas (traffic-weighted aggregation
-// needs per-replica arrival rates the stream does not carry).
+// Online realization: ŷ50 = p50_trend_pred (the model's prediction when
+// prediction is ON; the formula's current score otherwise) and y50 =
+// y50_current (dsb wire field 8; falls back to the p50 channel on older
+// producers). Both are aggregated to service level as the mean over healthy
+// replicas (traffic-weighted aggregation needs per-replica arrival rates
+// the stream does not carry).
 //
 // Eq. (2) — isolation saturated proportional (P-only) on the extrinsic
 // tail magnitude e_iso(t) = y90(t)·%ext,90(t):
 //
 //	c(t) = min(c_base, max(c_min, c_base - k_p·(e_iso(t) - θ_ref)))
 //
-// %ext,90 has no field in this repo's proto yet, so %ext ≡ 1 (e_iso =
-// tail_trend_label). c(t) is the TOTAL core budget for the aggressor set
+// e_iso = tail_trend_label × ext_pct_90 (dsb wire field 10; ≡1 on older
+// producers). c(t) is the TOTAL core budget for the aggressor set
 // on the node: c_base = shareable cores (node CPUs minus the victim's
 // share), c_min = the liveness floor (e.g. 1 core per aggressor). The
 // isolate actuator divides c(t) evenly across the matched aggressor pods
@@ -110,17 +111,19 @@ func (c *controller) formulaTick(ctx context.Context, jobs []tickJob) {
 	f := c.cfg.formula
 
 	// ── Eq. (1): horizontal, one decision per service per tick ──
-	var yhat float64
+	var yhat, ynow float64
 	for _, j := range jobs {
-		yhat += j.fv.P50Now
+		yhat += j.fv.P50Now     // ŷ50: prediction channel
+		ynow += j.fv.Y50Current // y50: current observed (falls back to ŷ50)
 	}
 	yhat /= float64(len(jobs))
+	ynow /= float64(len(jobs))
 
 	u := 0
 	switch {
 	case yhat > f.thetaOn && c.fstate.n < f.nMax:
 		u = +1
-	case yhat < f.thetaOff && yhat < f.thetaOn && c.fstate.n > 0:
+	case ynow < f.thetaOff && yhat < f.thetaOn && c.fstate.n > 0:
 		u = -1
 	}
 	if u != 0 {
@@ -136,12 +139,14 @@ func (c *controller) formulaTick(ctx context.Context, jobs []tickJob) {
 			},
 		}, jobs[0].podName, jobs[0].nodeName)
 		c.logger.Info("formula: horizontal step",
-			"u", u, "n", c.fstate.n, "yhat50", fmt.Sprintf("%.3f", yhat))
+			"u", u, "n", c.fstate.n,
+			"yhat50", fmt.Sprintf("%.3f", yhat),
+			"y50", fmt.Sprintf("%.3f", ynow))
 	}
 
 	// ── Eq. (2): isolation, one cap per pod per tick ──
 	for _, j := range jobs {
-		eIso := j.fv.TailNow // %ext ≡ 1 until the proto carries it
+		eIso := j.fv.TailNow * j.fv.ExtPct90 // e_iso = y90 · %ext,90
 		cap := f.capBase - f.kP*(eIso-f.thetaRef)
 		cap = math.Min(f.capBase, math.Max(f.capMin, cap))
 		last, seen := c.fstate.lastCap[j.podName]
@@ -151,9 +156,10 @@ func (c *controller) formulaTick(ctx context.Context, jobs []tickJob) {
 		// Score trace: one CSV row per replica per tick, so mitigated runs
 		// keep the full per-replica score curves alongside controller state.
 		if tf := c.cfg.scoreTrace; tf != nil {
-			fmt.Fprintf(tf, "%d,%s,%s,%.4f,%.4f,%d,%.2f\n",
+			fmt.Fprintf(tf, "%d,%s,%s,%.4f,%.4f,%.4f,%.4f,%.4f,%d,%.2f\n",
 				time.Now().UnixMilli(), c.target.Name, j.podName,
-				j.fv.P50Now, eIso, c.fstate.n, last)
+				j.fv.P50Now, j.fv.Y50Current, j.fv.TailNow, j.fv.ExtPct90,
+				eIso, c.fstate.n, last)
 		}
 		// Quantize + hysteresis so score noise straddling a quantum boundary
 		// does not flap between adjacent caps. This bounds steady-state write

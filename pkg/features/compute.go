@@ -30,8 +30,11 @@ type FeatureVector struct {
 	PersistenceH     int       // count of P50H entries >= HiThreshold
 
 	// Temporal features (rolling window over p50_trend_pred).
-	P50Now             float64 // latest p50_trend_pred
-	TailNow            float64 // latest tail_trend_label
+	P50Now             float64 // latest p50_trend_pred (= ŷ50 when prediction is on)
+	TailNow            float64 // latest tail_trend_label (= formula y90)
+	Y50Current         float64 // latest y50_current (formula y50 at "now"); falls back to P50Now when absent
+	ExtPct50           float64 // extrinsic share of p50 displacement; 1 when absent
+	ExtPct90           float64 // extrinsic share of p90 displacement; 1 when absent
 	KTemporal          float64 // least-squares slope over window (score/s)
 	AccelTemporal      float64 // mean second-difference over window
 	Variance           float64 // sample variance over window
@@ -65,6 +68,20 @@ func Build(latest *pb.ScoreEvent, window []Sample, cfg BuildConfig) FeatureVecto
 		fv.TailNow = float64(latest.TailTrendLabel)
 		fv.ModelVer = latest.ModelVersion
 		fv.SourceKind = latest.SourceKind
+		// dsb fields 8-10; zero means "not emitted by this producer build":
+		// y50_current falls back to the p50 channel, ext factors to 1.
+		fv.Y50Current = float64(latest.Y50Current)
+		if fv.Y50Current == 0 {
+			fv.Y50Current = fv.P50Now
+		}
+		fv.ExtPct50 = float64(latest.ExtPct50)
+		if fv.ExtPct50 == 0 {
+			fv.ExtPct50 = 1
+		}
+		fv.ExtPct90 = float64(latest.ExtPct90)
+		if fv.ExtPct90 == 0 {
+			fv.ExtPct90 = 1
+		}
 		fv.HasSpatial = len(latest.P50Horizons) > 0
 		fv.P50H = toFloat64s(latest.P50Horizons)
 		fv.TailH = toFloat64s(latest.TailHorizons)

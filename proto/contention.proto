@@ -29,9 +29,22 @@ message ScoreEvent {
   string model_version    = 6;   // changes with each retrain
   string source_kind      = 7;   // "onnx" | "formula" | ...
 
+  // Fields 8-11 mirror the dsb-side wire contract (the producer). With
+  // prediction ON, p50_trend_pred carries the model and y50_current the
+  // formula's current score; with prediction OFF they are equal. The
+  // ext_pct_* factors attribute score displacement to extrinsic
+  // interference vs the victim's own load; 0 means "not emitted" and
+  // consumers should treat it as 1.
+  float y50_current = 8;    // formula y50 at "now" (no prediction)
+  float ext_pct50   = 9;    // extrinsic share of the p50 displacement [0,1]
+  float ext_pct90   = 10;   // extrinsic share of the p90 displacement [0,1]
+  reserved 11;              // dsb-side expansion space
+
   // Multi-horizon spatial predictions (plan v2). Older predictors may leave
   // these empty; consumers must degrade gracefully when len()==0.
-  repeated float p50_horizons  = 8;   // predictions at horizons indexed by horizon_ms
-  repeated float tail_horizons = 9;   // tail side, same indexing
-  repeated int32 horizon_ms    = 10;  // parallel array of horizon offsets in ms
+  // Moved from 8-10 to 12-14: the old numbers collided with the dsb fields
+  // above (a scalar float on the wire parsed as a 1-element repeated float).
+  repeated float p50_horizons  = 12;  // predictions at horizons indexed by horizon_ms
+  repeated float tail_horizons = 13;  // tail side, same indexing
+  repeated int32 horizon_ms    = 14;  // parallel array of horizon offsets in ms
 }
