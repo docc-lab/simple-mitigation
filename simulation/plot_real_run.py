@@ -56,6 +56,52 @@ def load_scores(path):
     return out
 
 
+def load_score_log(path):
+    """Parse a victim score_events.log (logfmt, possibly ANSI-colored) into
+    the same channel dict as the controller CSV. Unmitigated reference runs
+    have no controller trace; this is their sensor record."""
+    import re
+    pat = {k: re.compile(k + r'=(?:\x1b\[0m)?([0-9.eE+-]+)') for k in
+           ('p50_trend_pred', 'y50_current', 'tail_trend_label', 'ext_pct_90',
+            'sample_id')}
+    tpat = re.compile(r'timestamp=(?:\x1b\[0m)?([0-9T:.Z-]+)')
+    t, sid, yhat, y50, y90, ext = [], [], [], [], [], []
+    for line in open(path, encoding='utf-8', errors='replace'):
+        if 'score_event' not in line:
+            continue
+        vals = {}
+        for k, p in pat.items():
+            m = p.search(line)
+            if m:
+                vals[k] = float(m.group(1))
+        m = tpat.search(line)
+        if len(vals) < 5 or not m:
+            continue
+        ts = datetime.fromisoformat(m.group(1).replace('Z', '+00:00')).timestamp()
+        t.append(ts)
+        sid.append(vals['sample_id'])
+        yhat.append(vals['p50_trend_pred'])
+        y50.append(vals['y50_current'])
+        y90.append(vals['tail_trend_label'])
+        ext.append(vals['ext_pct_90'] if vals['ext_pct_90'] > 0 else 1.0)
+    # The log sink stamps whole seconds, collapsing ~10 events per second
+    # onto one x. sample_id ticks every 100 ms, so rebuild sub-second time
+    # from it, anchored so the reconstruction tracks the coarse stamps.
+    if len(t) > 1:
+        sid_a = np.array(sid)
+        t_a = np.array(t)
+        recon = t_a[0] + (sid_a - sid_a[0]) * 0.1
+        recon += np.median(t_a - recon)  # re-anchor against clock drift
+        t = list(recon)
+    y90 = np.array(y90)
+    ext = np.array(ext)
+    n = np.zeros(len(t))
+    return dict(t=np.array(t), yhat50=np.array(yhat), y50=np.array(y50),
+                y90=y90, ext90=ext, e_iso=y90 * ext,
+                n=n, applied_cap=np.full(len(t), np.nan),
+                pod=np.array(['victim'] * len(t)))
+
+
 def load_replica(path):
     d = json.load(open(path))
     t, p99, p50, rps = [], [], [], []
@@ -76,7 +122,9 @@ def load_replica(path):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--scores', required=True)
+    src = ap.add_mutually_exclusive_group(required=True)
+    src.add_argument('--scores', help='controller SCORE_TRACE csv (mitigated runs)')
+    src.add_argument('--score-log', help='victim score_events.log (unmitigated refs)')
     ap.add_argument('--run-data', required=True,
                     help='glob for per-replica run_data JSONs')
     ap.add_argument('--label', default='run')
@@ -85,8 +133,10 @@ def main():
     ap.add_argument('--theta-ref', type=float, default=0.55)
     args = ap.parse_args()
 
-    sc = load_scores(os.path.join(SIM_DIR, args.scores)
-                     if not os.path.isabs(args.scores) else args.scores)
+    def _p(x):
+        return x if os.path.isabs(x) else os.path.join(SIM_DIR, x)
+    mitigated = args.scores is not None
+    sc = load_scores(_p(args.scores)) if mitigated else load_score_log(_p(args.score_log))
     pattern = args.run_data if os.path.isabs(args.run_data) else os.path.join(SIM_DIR, args.run_data)
     reps = [load_replica(p) for p in sorted(glob.glob(pattern))]
     if not reps:
@@ -100,7 +150,8 @@ def main():
 
     fig, axes = plt.subplots(5, 1, figsize=(14, 13), sharex=True,
                              gridspec_kw=dict(height_ratios=[3, 3, 2, 1.2, 1.4]))
-    fig.suptitle(f'{args.label}: live mitigated run — sensor channels, raw latency, '
+    kind = 'mitigated' if mitigated else 'unmitigated reference'
+    fig.suptitle(f'{args.label}: live {kind} run — sensor channels, raw latency, '
                  f'load, and controller actions', fontsize=11)
 
     # ── panel 0: score channels (node-4 replica / controller view) ──
@@ -126,7 +177,7 @@ def main():
         col = PALETTE[i % len(PALETTE)]
         ax.plot(r['t'] - t0, r['p99'], lw=0.3, alpha=0.25, c=col)
         ax.plot(r['t'] - t0, rolling_median(r['p99'], 21), lw=1.3, c=col,
-                label=f"{r['pod'][-5:]} p99")
+                label=f"{r['pod'] if len(r['pod']) <= 8 else r['pod'][-5:]} p99")
     ax.set_ylabel('latency (ms)')
     ax.set_yscale('log')
     ax.legend(fontsize=7, ncol=len(reps))
@@ -138,7 +189,7 @@ def main():
     for i, r in enumerate(reps):
         col = PALETTE[i % len(PALETTE)]
         ax.plot(r['t'] - t0, rolling_median(r['rps'], 21), lw=1.1, c=col,
-                label=r['pod'][-5:])
+                label=r['pod'] if len(r['pod']) <= 8 else r['pod'][-5:])
     ax.set_ylabel('arrival rps')
     ax.legend(fontsize=7, ncol=len(reps))
     ax.set_title('Load distribution across replicas', fontsize=9)
@@ -148,16 +199,21 @@ def main():
     ax.step(sc['t'][m] - t0, sc['n'][m] + 1, where='post', lw=1.4, c=PALETTE[0])
     ax.set_ylabel('replicas')
     ax.set_ylim(0.5, sc['n'][m].max() + 1.8)
-    ax.set_title('Horizontal: total replicas (1 baseline + n(t))', fontsize=9)
+    ax.set_title('Horizontal: total replicas (1 baseline + n(t))'
+                 + ('' if mitigated else '  [unmitigated reference: fixed at 1]'),
+                 fontsize=9)
 
     # ── panel 4: isolation budget ──
     ax = axes[4]
-    ax.step(sc['t'][m] - t0, sc['applied_cap'][m], where='post', lw=1.4, c=PALETTE[6])
+    if mitigated:
+        ax.step(sc['t'][m] - t0, sc['applied_cap'][m], where='post', lw=1.4, c=PALETTE[6])
+        ax.set_ylim(0, np.nanmax(sc['applied_cap'][m]) * 1.15 + 1)
+        ax.set_title('Isolation: aggressor core budget c(t)', fontsize=9)
+    else:
+        ax.set_ylim(0, 30)
+        ax.set_title('Isolation: n/a (unmitigated reference)', fontsize=9)
     ax.set_ylabel('cores')
-    ax.set_ylim(0, sc['applied_cap'][m].max() * 1.15 + 1)
     ax.set_xlabel('time (s)')
-    ax.set_title('Isolation: aggressor core budget c(t) (flat at c_base = never throttled)',
-                 fontsize=9)
 
     plt.tight_layout()
     os.makedirs(RESULTS_DIR, exist_ok=True)

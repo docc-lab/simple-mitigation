@@ -38,6 +38,8 @@ import (
 	"time"
 
 	"github.com/coding-workspace/simple-mitigation-1/pkg/policy"
+
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 // Defaults match simulation/simulation.py's flag defaults (the paper's
@@ -54,6 +56,10 @@ type formulaConfig struct {
 	// actuator never squeezes a pod below this, so the effective aggregate
 	// floor is minPerPod x N(matched pods).
 	minPerPod float64
+	// yhatFromCurrent substitutes y50_current for ŷ50 in Eq.(1)'s scale-up
+	// term. Use while the producer's prediction channel is unreliable
+	// (equivalent to prediction-off semantics enforced controller-side).
+	yhatFromCurrent bool
 
 	// Actuation plumbing (not part of the formulas).
 	capQuantum         float64 // cap resolution: dispatch in steps of this many cores
@@ -77,6 +83,7 @@ func loadFormulaConfig() *formulaConfig {
 		capBase:            envFloat("CAP_BASE_CORES", 4.0),
 		capMin:             envFloat("CAP_MIN_CORES", 0.5),
 		minPerPod:          envFloat("CAP_MIN_PER_POD_CORES", 0),
+		yhatFromCurrent:    os.Getenv("YHAT_FROM_CURRENT") == "1",
 		capQuantum:         envFloat("CAP_QUANTUM_CORES", 0.25),
 		capHysteresis:      envFloat("CAP_HYSTERESIS_FRACTION", 0.75),
 		aggressorSelector:  envStr("AGGRESSOR_SELECTOR", "tier=batch"),
@@ -92,6 +99,7 @@ func (f *formulaConfig) logAttrs() []any {
 		"cap_base", f.capBase, "cap_min", f.capMin,
 		"min_per_pod", f.minPerPod,
 		"cap_quantum", f.capQuantum,
+		"yhat_from_current", f.yhatFromCurrent,
 	}
 }
 
@@ -100,6 +108,45 @@ func (f *formulaConfig) logAttrs() []any {
 type formulaState struct {
 	n       int                // Eq.1 replica counter n(t), extra replicas above baseline
 	lastCap map[string]float64 // pod -> last dispatched quantized cap (cores)
+	// lastNSync rate-limits the n(t) <-> Deployment reconciliation below.
+	lastNSync time.Time
+}
+
+// syncN reconciles the commanded counter n(t) with the Deployment's actual
+// replica count. Needed because n is open-loop state: an external reset
+// (e.g. the experiment harness re-applying the victim manifest between
+// runs) changes real replicas without the controller stepping n, after
+// which Eq.(1) regulates against a phantom count. Skipped offline (no kube
+// client).
+func (c *controller) syncN(ctx context.Context, f *formulaConfig) {
+	if c.kclient == nil {
+		return
+	}
+	now := time.Now()
+	if now.Sub(c.fstate.lastNSync) < 5*time.Second {
+		return
+	}
+	c.fstate.lastNSync = now
+	scale, err := c.kclient.AppsV1().Deployments(c.target.Namespace).
+		GetScale(ctx, c.target.Name, metav1.GetOptions{})
+	if err != nil {
+		c.logger.Warn("formula: n resync failed", "err", err)
+		return
+	}
+	baseline := envInt("BASELINE_REPLICAS", 1)
+	real := int(scale.Spec.Replicas) - baseline
+	if real < 0 {
+		real = 0
+	}
+	if real > f.nMax {
+		real = f.nMax
+	}
+	if real != c.fstate.n {
+		c.logger.Info("formula: n resynced to actual replicas",
+			"n_was", c.fstate.n, "n_now", real,
+			"deployment_replicas", scale.Spec.Replicas)
+		c.fstate.n = real
+	}
 }
 
 // formulaTick runs both laws for one tick. jobs carries one entry per
@@ -109,6 +156,7 @@ func (c *controller) formulaTick(ctx context.Context, jobs []tickJob) {
 		c.fstate = &formulaState{lastCap: map[string]float64{}}
 	}
 	f := c.cfg.formula
+	c.syncN(ctx, f)
 
 	// ── Eq. (1): horizontal, one decision per service per tick ──
 	var yhat, ynow float64
@@ -118,6 +166,9 @@ func (c *controller) formulaTick(ctx context.Context, jobs []tickJob) {
 	}
 	yhat /= float64(len(jobs))
 	ynow /= float64(len(jobs))
+	if f.yhatFromCurrent {
+		yhat = ynow
+	}
 
 	u := 0
 	switch {
