@@ -1,0 +1,9 @@
+# Real-deployment targets for stage-3 mitigation runs: the hotelReservation
+# search victim (score-emitting image), as deployed by stage3-eval.sh.
+targets:
+  - name: search
+    namespace: default
+    selector:
+      io.kompose.service: search
+    scorePort: 7900
+    containerName: hotel-reserv-search

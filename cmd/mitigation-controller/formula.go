@@ -21,9 +21,12 @@
 //	c(t) = min(c_base, max(c_min, c_base - k_p·(e_iso(t) - θ_ref)))
 //
 // %ext,90 has no field in this repo's proto yet, so %ext ≡ 1 (e_iso =
-// tail_trend_label). c(t) is computed per pod and dispatched to the isolate
-// actuator's absolute-cap mode (cap_cores), quantized to CAP_QUANTUM_CORES
-// so sensor noise does not turn into a cgroup write per tick.
+// tail_trend_label). c(t) is the TOTAL core budget for the aggressor set
+// on the node: c_base = shareable cores (node CPUs minus the victim's
+// share), c_min = the liveness floor (e.g. 1 core per aggressor). The
+// isolate actuator divides c(t) evenly across the matched aggressor pods
+// (param cap_total_cores). The cap is quantized to CAP_QUANTUM_CORES with
+// hysteresis so sensor noise does not turn into a cgroup write per tick.
 package main
 
 import (
@@ -31,6 +34,7 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"time"
 
 	"github.com/coding-workspace/simple-mitigation-1/pkg/policy"
 )
@@ -43,8 +47,12 @@ type formulaConfig struct {
 	nMax     int     // Eq.1 n_max
 	thetaRef float64 // Eq.2 θ_ref
 	kP       float64 // Eq.2 k_p (cores per unit score)
-	capBase  float64 // Eq.2 c_base (cores)
-	capMin   float64 // Eq.2 c_min (cores)
+	capBase  float64 // Eq.2 c_base (total cores)
+	capMin   float64 // Eq.2 c_min (total cores; static lower clamp)
+	// minPerPod > 0 makes the floor dynamic in the aggressor count: the
+	// actuator never squeezes a pod below this, so the effective aggregate
+	// floor is minPerPod x N(matched pods).
+	minPerPod float64
 
 	// Actuation plumbing (not part of the formulas).
 	capQuantum         float64 // cap resolution: dispatch in steps of this many cores
@@ -67,6 +75,7 @@ func loadFormulaConfig() *formulaConfig {
 		kP:                 envFloat("K_P", 6.4),
 		capBase:            envFloat("CAP_BASE_CORES", 4.0),
 		capMin:             envFloat("CAP_MIN_CORES", 0.5),
+		minPerPod:          envFloat("CAP_MIN_PER_POD_CORES", 0),
 		capQuantum:         envFloat("CAP_QUANTUM_CORES", 0.25),
 		capHysteresis:      envFloat("CAP_HYSTERESIS_FRACTION", 0.75),
 		aggressorSelector:  envStr("AGGRESSOR_SELECTOR", "tier=batch"),
@@ -80,6 +89,7 @@ func (f *formulaConfig) logAttrs() []any {
 		"theta_on", f.thetaOn, "theta_off", f.thetaOff, "n_max", f.nMax,
 		"theta_ref", f.thetaRef, "k_p", f.kP,
 		"cap_base", f.capBase, "cap_min", f.capMin,
+		"min_per_pod", f.minPerPod,
 		"cap_quantum", f.capQuantum,
 	}
 }
@@ -138,6 +148,13 @@ func (c *controller) formulaTick(ctx context.Context, jobs []tickJob) {
 		if !seen {
 			last = f.capBase // unthrottled is the implicit starting state
 		}
+		// Score trace: one CSV row per replica per tick, so mitigated runs
+		// keep the full per-replica score curves alongside controller state.
+		if tf := c.cfg.scoreTrace; tf != nil {
+			fmt.Fprintf(tf, "%d,%s,%s,%.4f,%.4f,%d,%.2f\n",
+				time.Now().UnixMilli(), c.target.Name, j.podName,
+				j.fv.P50Now, eIso, c.fstate.n, last)
+		}
 		// Quantize + hysteresis so score noise straddling a quantum boundary
 		// does not flap between adjacent caps. This bounds steady-state write
 		// chatter only — real level shifts still dispatch on consecutive
@@ -158,7 +175,8 @@ func (c *controller) formulaTick(ctx context.Context, jobs []tickJob) {
 			Pod:      j.podName,
 			Kind:     "isolate",
 			Params: map[string]any{
-				"cap_cores":           q,
+				"cap_total_cores":     q,
+				"min_per_pod_cores":   f.minPerPod,
 				"period_us":           f.periodUs,
 				"aggressor_selector":  f.aggressorSelector,
 				"aggressor_namespace": f.aggressorNamespace,
@@ -166,6 +184,6 @@ func (c *controller) formulaTick(ctx context.Context, jobs []tickJob) {
 		}, j.podName, j.nodeName)
 		c.logger.Info("formula: isolation cap",
 			"pod", j.podName, "e_iso", fmt.Sprintf("%.3f", eIso),
-			"cap_cores", q, "prev", last)
+			"cap_total_cores", q, "prev", last)
 	}
 }

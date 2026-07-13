@@ -87,13 +87,17 @@ func (a *Actuator) Apply(ctx context.Context, target actuators.Target, params ma
 	if selStr == "" {
 		return actuators.ActionResult{}, fmt.Errorf("isolate: aggressor_selector param required")
 	}
-	m, err := buildMode(params)
-	if err != nil {
-		return actuators.ActionResult{}, err
-	}
+	// mode is built after listing so cap_total_cores can be divided across
+	// the matched aggressor set (see below).
 	ns := target.Spec.Namespace
 	if v, ok := params["aggressor_namespace"].(string); ok && v != "" {
-		ns = v
+		if v == "*" {
+			// Aggressors may span testbeds/namespaces (e.g. stage-3's mixed
+			// arms); "*" lists cluster-wide, still node-scoped below.
+			ns = metav1.NamespaceAll
+		} else {
+			ns = v
+		}
 	}
 
 	pods, err := a.client.CoreV1().Pods(ns).List(ctx, metav1.ListOptions{
@@ -108,6 +112,30 @@ func (a *Actuator) Apply(ctx context.Context, target actuators.Target, params ma
 			Applied: false,
 			Reason:  fmt.Sprintf("no aggressors on node %q matching %q", a.nodeName, selStr),
 		}, nil
+	}
+
+	// cap_total_cores: the rule's cap is a TOTAL core budget for the whole
+	// aggressor set; divide it evenly across the matched pods and fall
+	// through to per-pod absolute mode. min_per_pod_cores makes the floor
+	// dynamic in the matched-set size: no pod is ever squeezed below it, so
+	// the effective aggregate floor is min_per_pod x N.
+	if total, ok := paramFloatOK(params, "cap_total_cores"); ok {
+		perPod := total / float64(len(pods.Items))
+		if minPer, hasMin := paramFloatOK(params, "min_per_pod_cores"); hasMin && perPod < minPer {
+			perPod = minPer
+		}
+		clone := make(map[string]any, len(params)+1)
+		for k, v := range params {
+			clone[k] = v
+		}
+		delete(clone, "cap_total_cores")
+		delete(clone, "min_per_pod_cores")
+		clone["cap_cores"] = perPod
+		params = clone
+	}
+	m, err := buildMode(params)
+	if err != nil {
+		return actuators.ActionResult{}, err
 	}
 
 	var applied int

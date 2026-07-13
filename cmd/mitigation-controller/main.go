@@ -71,6 +71,9 @@ type runtimeConfig struct {
 	// formula is non-nil when FORMULA_MODE=1: the tick loop runs the paper's
 	// Eq. (1)/(2) control laws instead of CEL dispatch. See formula.go.
 	formula *formulaConfig
+	// scoreTrace, when SCORE_TRACE names a file, receives one CSV row per
+	// replica per tick: unix_ms,target,pod,p50,e_iso,n,applied_cap.
+	scoreTrace *os.File
 }
 
 func main() {
@@ -222,6 +225,17 @@ func loadConfig() (*runtimeConfig, error) {
 		return nil, fmt.Errorf("MAX_CPU: %w", err)
 	}
 	cooldownSec := envInt("HORIZONTAL_COOLDOWN_SEC", int(defaultHorizontalCooldown/time.Second))
+	var scoreTrace *os.File
+	if p := os.Getenv("SCORE_TRACE"); p != "" {
+		f, err := os.OpenFile(p, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+		if err != nil {
+			return nil, fmt.Errorf("SCORE_TRACE: %w", err)
+		}
+		if st, _ := f.Stat(); st != nil && st.Size() == 0 {
+			fmt.Fprintln(f, "unix_ms,target,pod,p50,e_iso,n,applied_cap")
+		}
+		scoreTrace = f
+	}
 	return &runtimeConfig{
 		nodeName:           nodeName,
 		targetsPath:        envStr("TARGETS_CONFIG", defaultTargetsPath),
@@ -234,6 +248,7 @@ func loadConfig() (*runtimeConfig, error) {
 		maxCPU:             maxQ,
 		horizontalCooldown: time.Duration(cooldownSec) * time.Second,
 		formula:            loadFormulaConfig(),
+		scoreTrace:         scoreTrace,
 	}, nil
 }
 
