@@ -7,10 +7,14 @@
 # gating on them would never fire.
 #
 # Run with HI_THRESHOLD=0.55 so duration_above_hi_ms matches the horizontal
-# rule's p50 threshold.
+# rule's p50 threshold, and WINDOW_SIZE=30: duration_above_hi_ms is measured
+# inside the rolling window, so the default 20 samples x 100ms spans only
+# ~1.9s and can never satisfy `duration_above_hi_ms >= 2000`.
 rules:
+  # window_size guard: with a cold window (<10 samples) k_temporal is the
+  # slope of ~2 points — startup noise reads as >0.5/s and fires spuriously.
   - name: isolate_rising_tail
-    when: "tail_now > 0.65 || k_temporal > 0.5"
+    when: "tail_now > 0.65 || (k_temporal > 0.5 && window_size >= 10)"
     fire:
       - kind: isolate
         params:

@@ -1,0 +1,12 @@
+# Policy file for FORMULA_MODE=1 runs. In formula mode the tick loop runs
+# the paper's Eq. (1) bang-bang + Eq. (2) saturated-P laws directly
+# (cmd/mitigation-controller/formula.go) and CEL dispatch is bypassed, but
+# the engine still requires a syntactically valid policy with >= 1 rule —
+# this disabled placeholder satisfies validation and never runs.
+rules:
+  - name: placeholder_formula_mode
+    when: "false"
+    fire:
+      - kind: isolate
+        params: { aggressor_selector: "tier=batch" }
+    enabled: false

@@ -58,16 +58,19 @@ const (
 )
 
 type runtimeConfig struct {
-	nodeName              string
-	targetsPath           string
-	policyPath            string
-	tick                  time.Duration
-	stale                 time.Duration
-	windowSize            int
-	hiThreshold           float64
-	minCPU                resource.Quantity
-	maxCPU                resource.Quantity
-	horizontalCooldown    time.Duration
+	nodeName           string
+	targetsPath        string
+	policyPath         string
+	tick               time.Duration
+	stale              time.Duration
+	windowSize         int
+	hiThreshold        float64
+	minCPU             resource.Quantity
+	maxCPU             resource.Quantity
+	horizontalCooldown time.Duration
+	// formula is non-nil when FORMULA_MODE=1: the tick loop runs the paper's
+	// Eq. (1)/(2) control laws instead of CEL dispatch. See formula.go.
+	formula *formulaConfig
 }
 
 func main() {
@@ -89,6 +92,10 @@ func main() {
 		"min_cpu", cfg.minCPU.String(), "max_cpu", cfg.maxCPU.String(),
 		"horizontal_cooldown", cfg.horizontalCooldown,
 	)
+	if cfg.formula != nil {
+		logger.Info("FORMULA mode: Eq.(1) bang-bang + Eq.(2) saturated-P replace CEL dispatch",
+			cfg.formula.logAttrs()...)
+	}
 
 	tcfg, err := targets.Load(cfg.targetsPath)
 	if err != nil {
@@ -226,6 +233,7 @@ func loadConfig() (*runtimeConfig, error) {
 		minCPU:             minQ,
 		maxCPU:             maxQ,
 		horizontalCooldown: time.Duration(cooldownSec) * time.Second,
+		formula:            loadFormulaConfig(),
 	}, nil
 }
 
@@ -263,6 +271,11 @@ type controller struct {
 	// own NODE_NAME (informer is field-selected) but keeping a map keeps the
 	// data flow symmetric with v1.
 	nodeByPod map[string]string
+
+	// fstate holds formula-mode controller state (Eq.1 replica counter,
+	// per-pod last dispatched cap). Only touched from this target's tick
+	// goroutine. Nil until the first formula tick.
+	fstate *formulaState
 }
 
 func (c *controller) run(ctx context.Context) {
@@ -344,15 +357,17 @@ func (c *controller) discoveryLoop(ctx context.Context, w *podwatch.Watcher) {
 	}
 }
 
+// tickJob is one healthy pod's fresh FeatureVector, ready for evaluation.
+type tickJob struct {
+	podName  string
+	nodeName string
+	fv       features.FeatureVector
+}
+
 func (c *controller) tick(ctx context.Context, now time.Time) {
 	snaps := c.pool.LatestForTarget(c.target.Name, c.cfg.stale)
 	c.mu.Lock()
-	type job struct {
-		podName  string
-		nodeName string
-		fv       features.FeatureVector
-	}
-	var jobs []job
+	var jobs []tickJob
 	for _, snap := range snaps {
 		if !snap.Healthy || snap.Event == nil {
 			continue
@@ -368,13 +383,21 @@ func (c *controller) tick(ctx context.Context, now time.Time) {
 		})
 		fv.Target = c.target.Name
 		fv.Pod = snap.Pod
-		jobs = append(jobs, job{
+		jobs = append(jobs, tickJob{
 			podName:  snap.Pod,
 			nodeName: c.nodeByPod[snap.Pod],
 			fv:       fv,
 		})
 	}
 	c.mu.Unlock()
+
+	// Formula mode: the paper's control laws replace CEL dispatch entirely.
+	if c.cfg.formula != nil {
+		if len(jobs) > 0 {
+			c.formulaTick(ctx, jobs)
+		}
+		return
+	}
 
 	for _, j := range jobs {
 		actions := c.engine.Evaluate(j.fv, now)
