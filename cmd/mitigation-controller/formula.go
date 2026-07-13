@@ -47,7 +47,8 @@ type formulaConfig struct {
 	capMin   float64 // Eq.2 c_min (cores)
 
 	// Actuation plumbing (not part of the formulas).
-	capQuantum         float64 // dispatch isolate only when the quantized cap changes
+	capQuantum         float64 // cap resolution: dispatch in steps of this many cores
+	capHysteresis      float64 // leave the current step only when the raw cap moved this fraction of a quantum away
 	aggressorSelector  string
 	aggressorNamespace string
 	periodUs           int
@@ -67,6 +68,7 @@ func loadFormulaConfig() *formulaConfig {
 		capBase:            envFloat("CAP_BASE_CORES", 4.0),
 		capMin:             envFloat("CAP_MIN_CORES", 0.5),
 		capQuantum:         envFloat("CAP_QUANTUM_CORES", 0.25),
+		capHysteresis:      envFloat("CAP_HYSTERESIS_FRACTION", 0.75),
 		aggressorSelector:  envStr("AGGRESSOR_SELECTOR", "tier=batch"),
 		aggressorNamespace: os.Getenv("AGGRESSOR_NAMESPACE"),
 		periodUs:           envInt("ISOLATE_PERIOD_US", 100000),
@@ -132,12 +134,20 @@ func (c *controller) formulaTick(ctx context.Context, jobs []tickJob) {
 		eIso := j.fv.TailNow // %ext ≡ 1 until the proto carries it
 		cap := f.capBase - f.kP*(eIso-f.thetaRef)
 		cap = math.Min(f.capBase, math.Max(f.capMin, cap))
-		// Quantize so noise does not produce a cgroup write every tick.
-		q := math.Round(cap/f.capQuantum) * f.capQuantum
 		last, seen := c.fstate.lastCap[j.podName]
 		if !seen {
 			last = f.capBase // unthrottled is the implicit starting state
 		}
+		// Quantize + hysteresis so score noise straddling a quantum boundary
+		// does not flap between adjacent caps. This bounds steady-state write
+		// chatter only — real level shifts still dispatch on consecutive
+		// ticks; there is no minimum interval between writes. (cpu.max is
+		// enforced per CFS period anyway, so sub-period writes carry no
+		// additional mitigation.)
+		if math.Abs(cap-last) < f.capHysteresis*f.capQuantum {
+			continue
+		}
+		q := math.Round(cap/f.capQuantum) * f.capQuantum
 		if q == last {
 			continue
 		}
