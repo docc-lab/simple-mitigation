@@ -60,6 +60,19 @@ type formulaConfig struct {
 	// term. Use while the producer's prediction channel is unreliable
 	// (equivalent to prediction-off semantics enforced controller-side).
 	yhatFromCurrent bool
+	// armFile, when set (FORMULA_ARM_FILE), gates ACTUATION on the file's
+	// existence: the controller senses, computes, and traces from startup,
+	// but dispatches nothing until the file appears. Gives phased
+	// experiments a clean unmitigated->mitigated boundary with continuous
+	// sensor state. Empty = always armed.
+	armFile string
+	// Per-pod guarantees for the shared-pool isolation model: every
+	// aggressor keeps guaranteeDefault cores (guaranteeHR for pods in
+	// guaranteeHRNs); Eq.(2)'s c(t) governs only the discretionary pool on
+	// top, so c_min=0 no longer starves anyone.
+	guaranteeDefault float64
+	guaranteeHR      float64
+	guaranteeHRNs    string
 
 	// Actuation plumbing (not part of the formulas).
 	capQuantum         float64 // cap resolution: dispatch in steps of this many cores
@@ -84,6 +97,10 @@ func loadFormulaConfig() *formulaConfig {
 		capMin:             envFloat("CAP_MIN_CORES", 0.5),
 		minPerPod:          envFloat("CAP_MIN_PER_POD_CORES", 0),
 		yhatFromCurrent:    os.Getenv("YHAT_FROM_CURRENT") == "1",
+		armFile:            os.Getenv("FORMULA_ARM_FILE"),
+		guaranteeDefault:   envFloat("AGGRESSOR_GUARANTEE_CORES", 0),
+		guaranteeHR:        envFloat("AGGRESSOR_GUARANTEE_HR_CORES", 0),
+		guaranteeHRNs:      envStr("AGGRESSOR_GUARANTEE_HR_NS", "default"),
 		capQuantum:         envFloat("CAP_QUANTUM_CORES", 0.25),
 		capHysteresis:      envFloat("CAP_HYSTERESIS_FRACTION", 0.75),
 		aggressorSelector:  envStr("AGGRESSOR_SELECTOR", "tier=batch"),
@@ -110,6 +127,27 @@ type formulaState struct {
 	lastCap map[string]float64 // pod -> last dispatched quantized cap (cores)
 	// lastNSync rate-limits the n(t) <-> Deployment reconciliation below.
 	lastNSync time.Time
+	// armed latches true once the arm file appears (or immediately when no
+	// arm file is configured).
+	armed bool
+}
+
+// checkArmed reports whether actuation is enabled, latching on first sight
+// of the arm file so a later file deletion doesn't silently disarm mid-run.
+func (c *controller) checkArmed(f *formulaConfig) bool {
+	if c.fstate.armed {
+		return true
+	}
+	if f.armFile == "" {
+		c.fstate.armed = true
+		return true
+	}
+	if _, err := os.Stat(f.armFile); err == nil {
+		c.fstate.armed = true
+		c.logger.Info("formula: actuation ARMED", "arm_file", f.armFile)
+		return true
+	}
+	return false
 }
 
 // syncN reconciles the commanded counter n(t) with the Deployment's actual
@@ -157,6 +195,7 @@ func (c *controller) formulaTick(ctx context.Context, jobs []tickJob) {
 	}
 	f := c.cfg.formula
 	c.syncN(ctx, f)
+	armed := c.checkArmed(f)
 
 	// ── Eq. (1): horizontal, one decision per service per tick ──
 	var yhat, ynow float64
@@ -177,7 +216,7 @@ func (c *controller) formulaTick(ctx context.Context, jobs []tickJob) {
 	case ynow < f.thetaOff && yhat < f.thetaOn && c.fstate.n > 0:
 		u = -1
 	}
-	if u != 0 {
+	if u != 0 && armed {
 		c.fstate.n += u
 		c.dispatch(ctx, policy.ActionRequest{
 			RuleName: "formula_horizontal",
@@ -225,6 +264,12 @@ func (c *controller) formulaTick(ctx context.Context, jobs []tickJob) {
 		if q == last {
 			continue
 		}
+		if !armed {
+			// Disarmed: the trace above records what the law WOULD do; no
+			// dispatch, no latch (so arming applies the current desired cap
+			// immediately rather than replaying stale deltas).
+			continue
+		}
 		c.fstate.lastCap[j.podName] = q
 		c.dispatch(ctx, policy.ActionRequest{
 			RuleName: "formula_isolation",
@@ -232,11 +277,14 @@ func (c *controller) formulaTick(ctx context.Context, jobs []tickJob) {
 			Pod:      j.podName,
 			Kind:     "isolate",
 			Params: map[string]any{
-				"cap_total_cores":     q,
-				"min_per_pod_cores":   f.minPerPod,
-				"period_us":           f.periodUs,
-				"aggressor_selector":  f.aggressorSelector,
-				"aggressor_namespace": f.aggressorNamespace,
+				"cap_total_cores":       q,
+				"min_per_pod_cores":     f.minPerPod,
+				"guarantee_cores":       f.guaranteeDefault,
+				"guarantee_hr_cores":    f.guaranteeHR,
+				"guarantee_hr_ns":       f.guaranteeHRNs,
+				"period_us":             f.periodUs,
+				"aggressor_selector":    f.aggressorSelector,
+				"aggressor_namespace":   f.aggressorNamespace,
 			},
 		}, j.podName, j.nodeName)
 		c.logger.Info("formula: isolation cap",

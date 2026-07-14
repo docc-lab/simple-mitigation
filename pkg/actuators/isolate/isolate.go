@@ -114,35 +114,68 @@ func (a *Actuator) Apply(ctx context.Context, target actuators.Target, params ma
 		}, nil
 	}
 
-	// cap_total_cores: the rule's cap is a TOTAL core budget for the whole
-	// aggressor set; divide it evenly across the matched pods and fall
-	// through to per-pod absolute mode. min_per_pod_cores makes the floor
-	// dynamic in the matched-set size: no pod is ever squeezed below it, so
-	// the effective aggregate floor is min_per_pod x N.
+	// cap_total_cores: the rule's cap is a TOTAL budget for the whole
+	// aggressor set. Two distribution models:
+	//   guarantee model (guarantee_cores set): the total is the SHARED POOL
+	//     only; each pod's quota = its per-pod guarantee (guarantee_hr_cores
+	//     for pods in guarantee_hr_ns, else guarantee_cores) + total/N.
+	//     c_min=0 then means "pool fully revoked", never starvation.
+	//   uniform model (legacy): quota = total/N, floored at
+	//     min_per_pod_cores.
+	perPodCap := func(ns string) (float64, bool) { return 0, false }
 	if total, ok := paramFloatOK(params, "cap_total_cores"); ok {
-		perPod := total / float64(len(pods.Items))
-		if minPer, hasMin := paramFloatOK(params, "min_per_pod_cores"); hasMin && perPod < minPer {
-			perPod = minPer
+		share := total / float64(len(pods.Items))
+		gDef, hasG := paramFloatOK(params, "guarantee_cores")
+		gHR, _ := paramFloatOK(params, "guarantee_hr_cores")
+		gHRNs, _ := params["guarantee_hr_ns"].(string)
+		minPer, hasMin := paramFloatOK(params, "min_per_pod_cores")
+		if hasG && gDef > 0 {
+			perPodCap = func(ns string) (float64, bool) {
+				g := gDef
+				if gHR > 0 && ns == gHRNs {
+					g = gHR
+				}
+				return g + share, true
+			}
+		} else {
+			uni := share
+			if hasMin && uni < minPer {
+				uni = minPer
+			}
+			perPodCap = func(string) (float64, bool) { return uni, true }
 		}
-		clone := make(map[string]any, len(params)+1)
-		for k, v := range params {
-			clone[k] = v
-		}
-		delete(clone, "cap_total_cores")
-		delete(clone, "min_per_pod_cores")
-		clone["cap_cores"] = perPod
-		params = clone
 	}
-	m, err := buildMode(params)
-	if err != nil {
-		return actuators.ActionResult{}, err
+	baseParams := make(map[string]any, len(params))
+	for k, v := range params {
+		baseParams[k] = v
+	}
+	for _, k := range []string{"cap_total_cores", "min_per_pod_cores",
+		"guarantee_cores", "guarantee_hr_cores", "guarantee_hr_ns"} {
+		delete(baseParams, k)
+	}
+	modeFor := func(ns string) (mode, error) {
+		if cap, ok := perPodCap(ns); ok {
+			p := make(map[string]any, len(baseParams)+1)
+			for k, v := range baseParams {
+				p[k] = v
+			}
+			p["cap_cores"] = cap
+			return buildMode(p)
+		}
+		return buildMode(baseParams)
 	}
 
 	var applied int
 	touched := make([]string, 0, len(pods.Items))
 	var firstErr error
+	var lastAfter map[string]any
 	for i := range pods.Items {
 		pod := &pods.Items[i]
+		m, err := modeFor(pod.Namespace)
+		if err != nil {
+			return actuators.ActionResult{}, err
+		}
+		lastAfter = m.after
 		ok, err := a.applyPod(ctx, pod, m)
 		if err != nil {
 			if firstErr == nil {
@@ -158,7 +191,7 @@ func (a *Actuator) Apply(ctx context.Context, target actuators.Target, params ma
 		}
 	}
 	after := map[string]any{"changed_pods": touched}
-	for k, v := range m.after {
+	for k, v := range lastAfter {
 		after[k] = v
 	}
 	res := actuators.ActionResult{
