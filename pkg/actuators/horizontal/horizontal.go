@@ -75,9 +75,16 @@ func (a *Actuator) Apply(ctx context.Context, target actuators.Target, params ma
 	if target.Spec == nil {
 		return actuators.ActionResult{}, fmt.Errorf("horizontal: nil target spec")
 	}
-	deployName, err := a.resolveDeployment(ctx, target)
-	if err != nil {
-		return actuators.ActionResult{}, err
+	// Explicit override first: the overflow-deployment pattern scales a
+	// deployment that deliberately does NOT match the target selector
+	// (the victim deployment stays pinned at its baseline replicas).
+	deployName, _ := params["deployment"].(string)
+	if deployName == "" {
+		var err error
+		deployName, err = a.resolveDeployment(ctx, target)
+		if err != nil {
+			return actuators.ActionResult{}, err
+		}
 	}
 
 	deltaRaw, hasDelta := params["delta"]

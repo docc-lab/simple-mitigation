@@ -47,10 +47,32 @@ def rolling_median(x, w):
     return out
 
 
+BASE_COLS = ['unix_ms', 'target', 'pod', 'yhat50', 'y50', 'y90', 'ext90',
+             'e_iso', 'n', 'applied_cap']
+EXT_COLS = ['ext50', 'e_horz']
+
+
 def load_scores(path):
-    rows = list(csv.DictReader(open(path)))
-    out = {k: np.array([float(r[k]) for r in rows]) for k in
-           ('yhat50', 'y50', 'y90', 'ext90', 'e_iso', 'n', 'applied_cap')}
+    """SCORE_TRACE csv. The controller appends across runs of the same config
+    name, so one file can mix 10-column (old) and 12-column (ext50/e_horz)
+    rows under whichever header came first — parse positionally."""
+    rows = []
+    with open(path) as f:
+        for i, line in enumerate(f):
+            parts = line.rstrip('\n').split(',')
+            if i == 0 and parts[0] == 'unix_ms':
+                continue
+            if len(parts) < len(BASE_COLS):
+                continue
+            r = dict(zip(BASE_COLS, parts))
+            if len(parts) >= len(BASE_COLS) + 2:
+                r.update(zip(EXT_COLS, parts[len(BASE_COLS):]))
+            rows.append(r)
+    keys = [k for k in BASE_COLS[3:]]
+    if any('e_horz' in r for r in rows):
+        keys += EXT_COLS
+    out = {k: np.array([float(r.get(k, 'nan') or 'nan') for r in rows])
+           for k in keys}
     out['t'] = np.array([int(r['unix_ms']) for r in rows], float) / 1000.0
     out['pod'] = np.array([r['pod'] for r in rows])
     return out
@@ -117,7 +139,7 @@ def load_score_log(path):
 def load_replica(path):
     d = json.load(open(path))
     win_ms = d.get('window_interval_ms', 100)
-    t, p99, p50, rps, rq = [], [], [], [], []
+    t, p99, p90, p50, rps, rq = [], [], [], [], [], []
     for s in d['samples']:
         tw = s.get('timing_window', {})
         if not tw.get('request_count'):
@@ -126,12 +148,14 @@ def load_replica(path):
         tt = tw.get('total_time', {})
         t.append(ts)
         p99.append(tt.get('p99_ns', 0) / 1e6)
+        p90.append(tt.get('p90_ns', 0) / 1e6)
         p50.append(tt.get('p50_ns', 0) / 1e6)
         rps.append(tw.get('arrival_rps_1s', 0))
         rq.append(tw.get('request_count', 0))
     pod = os.path.basename(path).split('run_data-')[-1].replace('.json', '')
-    return dict(pod=pod, t=np.array(t), p99=np.array(p99), p50=np.array(p50),
-                rps=np.array(rps), rq=np.array(rq, float), win_ms=win_ms)
+    return dict(pod=pod, t=np.array(t), p99=np.array(p99), p90=np.array(p90),
+                p50=np.array(p50), rps=np.array(rps), rq=np.array(rq, float),
+                win_ms=win_ms)
 
 
 def agg_1s(t, v, w):
@@ -171,6 +195,22 @@ def main():
     ap.add_argument('--cap-base', type=float, default=8,
                     help='shared-pool size c_base; the isolation panel plots '
                          'the victim-side view c_base - c(t)')
+    ap.add_argument('--horz-theta-on', type=float, default=0.40,
+                    help='Eq.1 threshold for the e_horz channel (traces with '
+                         'ext50/e_horz columns)')
+    ap.add_argument('--horz-theta-off', type=float, default=0.15)
+    ap.add_argument('--show-yhat', action='store_true',
+                    help='plot the ŷ50 prediction channel (off by default: it '
+                         'no longer drives horizontal scaling and is pinned online)')
+    ap.add_argument('--tail-pct', type=int, default=99, choices=[90, 99],
+                    help='tail percentile for the top latency panel (default 99)')
+    ap.add_argument('--x-start', type=float, default=None,
+                    help='clip everything before this many seconds after t0 '
+                         '(drops the warmup/handoff region; e.g. 5)')
+    ap.add_argument('--phase-avgs', action='store_true',
+                    help='annotate the top panel with count-weighted p50/tail '
+                         'means for phase 2 (contention, disarmed) and phase 3 '
+                         '(mitigated)')
     args = ap.parse_args()
 
     def _p(x):
@@ -193,7 +233,16 @@ def main():
         lo = min(r['t'].min() for r in reps) - 5
         hi = max(r['t'].max() for r in reps) + 5
         t0 = lo
+    # --x-start clips the left edge: drop the warmup/handoff region so it
+    # neither shows nor drives the y-autoscale. Clipping the DATA (below,
+    # via x_start on every series) is what fixes autoscale; the xlim just
+    # frames it.
+    x_start = (args.x_start if args.x_start is not None else lo - t0)
+    lo = max(lo, t0 + x_start)
     m = (sc['t'] >= lo) & (sc['t'] <= hi)
+
+    def clip(rel):
+        return rel >= x_start
 
     marks = []
     for spec in args.mark:
@@ -208,18 +257,54 @@ def main():
     win_ms = reps[0].get('win_ms', 100)
 
     # ── panel 0: per-replica victim latency (1s aggregate) ──
+    tail_key = {90: 'p90', 99: 'p99'}[args.tail_pct]
+    tail_lbl = f'p{args.tail_pct}'
     ax = axes[0]
     for i, r in enumerate(reps):
         col = PALETTE[i % len(PALETTE)]
-        at, av = agg_1s(r['t'] - t0, r['p99'], r['rq'])
+        rel = r['t'] - t0
+        k = clip(rel)
+        at, av = agg_1s(rel[k], r[tail_key][k], r['rq'][k])
         ax.plot(at, av, lw=1.3, c=col,
-                label=f"{r['pod'] if len(r['pod']) <= 8 else r['pod'][-5:]} p99")
-        at, av = agg_1s(r['t'] - t0, r['p50'], r['rq'])
+                label=f"{r['pod'] if len(r['pod']) <= 8 else r['pod'][-5:]} {tail_lbl}")
+        at, av = agg_1s(rel[k], r['p50'][k], r['rq'][k])
         ax.plot(at, av, lw=1.0, ls='--', c=col, alpha=0.7,
                 label=f"{r['pod'] if len(r['pod']) <= 8 else r['pod'][-5:]} p50")
+
+    # Phase averages: count-weighted p50/tail across ALL replicas over the
+    # p2 (contention, disarmed) and p3 (mitigated) windows. Small settle
+    # margins skip the phase-edge transients (driver ramp-in, scale-out).
+    def phase_avg(key, lo_rel, hi_rel):
+        vals, wts = [], []
+        for r in reps:
+            rel = r['t'] - t0
+            k = (rel >= lo_rel) & (rel < hi_rel)
+            vals.append(r[key][k]); wts.append(r['rq'][k])
+        vals = np.concatenate(vals) if vals else np.array([])
+        wts = np.concatenate(wts) if wts else np.array([])
+        if len(vals) == 0:
+            return float('nan')
+        return float(np.average(vals, weights=np.maximum(wts, 1e-9)))
+
+    if args.phase_avgs:
+        arm_rel = next((x for x, l in marks if l == 'ARM'), None)
+        cont_rel = next((x for x, l in marks if l in ('contention', 'overload')), 20)
+        if arm_rel is not None:
+            phases = [('p2 (contention)', cont_rel + 5, arm_rel),
+                      ('p3 (mitigated)', arm_rel + 10, args.duration)]
+            trans = ax.get_xaxis_transform()  # x in data, y in axes fraction
+            for name, a, b in phases:
+                ap50 = phase_avg('p50', a, b)
+                atail = phase_avg(tail_key, a, b)
+                ax.text((a + b) / 2, 0.92,
+                        f"{name}\navg p50 {ap50:.1f} · {tail_lbl} {atail:.1f} ms",
+                        transform=trans, ha='center', va='top', fontsize=8,
+                        color='0.15', linespacing=1.4,
+                        bbox=dict(boxstyle='round', fc='white', ec='0.7', alpha=0.85))
+
     ax.set_ylabel('latency (ms)')
-    ax.legend(fontsize=7, ncol=max(1, len(reps)))
-    ax.set_title(f'Victim latency per replica (total_time p50/p99 from {win_ms:g}ms '
+    ax.legend(fontsize=7, ncol=max(1, len(reps)), loc='upper left')
+    ax.set_title(f'Victim latency per replica (total_time p50/{tail_lbl} from {win_ms:g}ms '
                  f'windows, count-weighted 1s mean; series start = replica creation)',
                  fontsize=9)
 
@@ -227,7 +312,9 @@ def main():
     ax = axes[1]
     for i, r in enumerate(reps):
         col = PALETTE[i % len(PALETTE)]
-        at, av = agg_1s(r['t'] - t0, r['rps'], np.ones_like(r['rps']))
+        rel = r['t'] - t0
+        k = clip(rel)
+        at, av = agg_1s(rel[k], r['rps'][k], np.ones_like(r['rps'][k]))
         ax.plot(at, av, lw=1.1, c=col,
                 label=r['pod'] if len(r['pod']) <= 8 else r['pod'][-5:])
     ax.set_ylabel('arrival rps')
@@ -235,13 +322,29 @@ def main():
     ax.set_title('Load distribution across replicas', fontsize=9)
 
     # ── panel 2: Eq.(1) horizontal — driving scores + replica response ──
+    # The prediction channel ŷ50 is deliberately NOT plotted: horizontal
+    # scaling is driven by the intrinsic-weighted formula signal e_horz =
+    # y50·(1−ext50) (the ablation this figure documents), and the pinned
+    # online ŷ50 only clutters. Pass --show-yhat to bring it back.
     ax = axes[2]
-    for key, lbl, col, alpha in [('yhat50', 'ŷ50 (prediction, drives Eq.1)', PALETTE[3], 0.6),
-                                 ('y50', 'y50_current (formula)', PALETTE[0], 0.9)]:
+    has_ehorz = 'e_horz' in sc
+    chans1 = []
+    if args.show_yhat:
+        chans1.append(('yhat50', 'ŷ50 (prediction, unused)', PALETTE[3], 0.4))
+    chans1.append(('y50', 'y50_current (formula)', PALETTE[0], 0.5 if has_ehorz else 0.9))
+    if has_ehorz:
+        chans1.append(('e_horz', 'e_horz = y50·(1−ext50) (drives Eq.1)', PALETTE[7], 0.95))
+    for key, lbl, col, alpha in chans1:
         bt, bv = bucket_median(sc['t'][m] - t0, sc[key][m])
-        ax.plot(bt, bv, lw=1.0, c=col, label=lbl, alpha=alpha)
-    ax.axhline(args.theta_on, ls='--', c='gray', lw=0.7, label=f'θ_on={args.theta_on}')
-    ax.axhline(args.theta_off, ls=':', c='gray', lw=0.7, label=f'θ_off={args.theta_off}')
+        ax.plot(bt, bv, lw=1.0 if alpha > 0.6 else 0.9, c=col, label=lbl, alpha=alpha)
+    if has_ehorz:
+        ax.axhline(args.horz_theta_on, ls='--', c='gray', lw=0.7,
+                   label=f'θ_on^horz={args.horz_theta_on}')
+        ax.axhline(args.horz_theta_off, ls=':', c='gray', lw=0.7,
+                   label=f'θ_off^horz={args.horz_theta_off}')
+    else:
+        ax.axhline(args.theta_on, ls='--', c='gray', lw=0.7, label=f'θ_on={args.theta_on}')
+        ax.axhline(args.theta_off, ls=':', c='gray', lw=0.7, label=f'θ_off={args.theta_off}')
     ax.set_ylabel('score')
     ax.set_ylim(-0.05, 1.12)
     ax2 = ax.twinx()
@@ -251,7 +354,8 @@ def main():
     ax2.tick_params(axis='y', labelcolor=PALETTE[1])
     ax2.set_ylim(0.5, max(4.5, nv.max() + 1.8))
     ax.legend(fontsize=7, ncol=4, loc='upper left')
-    ax.set_title('Eq.(1) horizontal bang-bang: ŷ50/y50 vs thresholds (left) '
+    lead = 'e_horz = y50·(1−ext50)' if has_ehorz else 'y50'
+    ax.set_title(f'Eq.(1) horizontal bang-bang: {lead} vs thresholds (left) '
                  '→ total replicas (right, orange)', fontsize=9)
 
     # ── panel 3: Eq.(2) isolation — driving signal + victim-side budget ──
@@ -282,6 +386,7 @@ def main():
     for ax in axes:
         for x, lbl in marks:
             ax.axvline(x, ls='-', c='crimson', lw=0.9, alpha=0.55)
+        ax.set_xlim(x_start, hi - t0)
     for x, lbl in marks:
         if lbl:
             axes[0].annotate(lbl, xy=(x, 1.06), xycoords=('data', 'axes fraction'),

@@ -1,0 +1,48 @@
+# Stage 3 PHASED sweep — intrinsic steady, SEVERE (victim 800 -> 2400 rps, fixed)
+#
+# Timeline (single 140 s run):
+#   p1  0-20 s   victim only @ 800 rps (baseline; intrinsic base rate)
+#   p2 20-80 s   contention, mitigation DISARMED (controller senses + traces)
+#   p3 80-140 s  same contention, mitigation ARMED (orchestrator touches the
+#                arm file at t=+80 s; see run-phased-stage3.sh)
+#
+# Run via the phase orchestrator, not stage3-eval.sh directly.
+
+experiment:
+  name: phased-int-steady-severe
+  duration_s: 140
+  warmup_s: 30
+  cooldown_s: 30
+  runs: 1
+  target_node: node-4
+testbeds:
+  hotelReservation:
+    # Intrinsic overload: baseline 800 rps all run; a second driver adds
+    # +1600 rps from t=+20 s (total 2400 rps in p2/p3).
+    loadgen:
+      rps: 800
+      shape: exp
+      extra: {rps: 1600, shape: fixed, start_offset_s: 20}
+  socialNetwork:
+    loadgen: {rps: 0}    # deploy-only: co-tenant pods present, no load
+    replicas: 2
+  sockshop:
+    loadgen: {rps: 0}    # deploy-only: co-tenant pods present, no load
+    replicas: 2
+victim:
+  testbed: hotelReservation
+  service: search
+  image: docclabgroup/search-online:v2.3.0
+  score_log: true
+aggressors:
+  # SN/SS co-tenants only. The HR services (profile/geo) are NOT listed:
+  # they receive the victim's own e2e traffic from t0 (same frontend), so
+  # pinning/labeling them as aggressors would let mitigation throttle
+  # traffic that is part of the victim workload.
+  - {testbed: socialNetwork, service: compose-post,  role: bad}
+  - {testbed: socialNetwork, service: post-storage,  role: bad}
+  - {testbed: socialNetwork, service: social-graph,  role: bad}
+  - {testbed: socialNetwork, service: user-timeline, role: bad}
+  - {testbed: sockshop, service: cart,      role: bad}
+  - {testbed: sockshop, service: catalogue, role: bad}
+  - {testbed: sockshop, service: order,     role: bad}

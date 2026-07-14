@@ -33,7 +33,7 @@ type FeatureVector struct {
 	P50Now             float64 // latest p50_trend_pred (= ŷ50 when prediction is on)
 	TailNow            float64 // latest tail_trend_label (= formula y90)
 	Y50Current         float64 // latest y50_current (formula y50 at "now"); falls back to P50Now when absent
-	ExtPct50           float64 // extrinsic share of p50 displacement; 1 when absent
+	ExtPct50           float64 // extrinsic share of p50 displacement; 0 when absent (see Build)
 	ExtPct90           float64 // extrinsic share of p90 displacement; 1 when absent
 	KTemporal          float64 // least-squares slope over window (score/s)
 	AccelTemporal      float64 // mean second-difference over window
@@ -69,15 +69,20 @@ func Build(latest *pb.ScoreEvent, window []Sample, cfg BuildConfig) FeatureVecto
 		fv.ModelVer = latest.ModelVersion
 		fv.SourceKind = latest.SourceKind
 		// dsb fields 8-10; zero means "not emitted by this producer build":
-		// y50_current falls back to the p50 channel, ext factors to 1.
+		// y50_current falls back to the p50 channel, ext_pct_90 to 1.
 		fv.Y50Current = float64(latest.Y50Current)
 		if fv.Y50Current == 0 {
 			fv.Y50Current = fv.P50Now
 		}
+		// ExtPct50 keeps a raw zero: its consumer is the horizontal law's
+		// intrinsic weighting e_horz = y50·(1−ext50), where a genuine
+		// ext50=0 (pure intrinsic contention) MUST yield full weight. An
+		// old producer that never emits the field then degenerates e_horz
+		// to plain y50 — the pre-decomposition behavior — which is the
+		// right failure mode. (ExtPct90's 1-fallback is the opposite call
+		// for the same reason: e_iso = y90·ext90 on an old producer should
+		// track y90, not vanish.)
 		fv.ExtPct50 = float64(latest.ExtPct50)
-		if fv.ExtPct50 == 0 {
-			fv.ExtPct50 = 1
-		}
 		fv.ExtPct90 = float64(latest.ExtPct90)
 		if fv.ExtPct90 == 0 {
 			fv.ExtPct90 = 1
