@@ -156,3 +156,42 @@ sweep parameters over the combos hardcoded in `fig_horizontal` /
   mitigation anywhere. Worth checking the exporter.
 - The p50/p90 split barely exists in these traces (p90 ≈ p50 for most
   scores); kg is the exception (p90 runs below p50).
+
+## plot_real_run.py — live-run figures (stage-3)
+
+Draws the 5-panel figure for one real cluster run: sensor channels
+(ŷ50/y50/y90/ext90/e_iso), per-replica raw p99, load distribution, n(t),
+and c(t).
+
+```bash
+# mitigated run (controller SCORE_TRACE csv):
+python plot_real_run.py --scores data/<run>/mitigation/<name>.scores.csv \
+    --run-data data/<run>/run_data.json --label <name> --theta-ref 0.35
+
+# unmitigated reference (victim score_events.log instead):
+python plot_real_run.py --score-log data/<run>/score_events.log \
+    --run-data data/<run>/run_data.json --label <name>-ref
+```
+
+Phased runs (p1 baseline / p2 unmitigated / p3 armed) add red phase
+markers and pin the x-axis origin to the run's t0:
+
+```bash
+t0=$(python -c "print(int(open('data/<run>/started_epoch_ns.txt').read())/1e9)")
+arm=$(python -c "print(int(open('data/<run>/armed_epoch_ns.txt').read())/1e9)")
+python plot_real_run.py --scores ... --run-data ... --label <name> \
+    --t0-epoch "$t0" \
+    --mark "$(python -c "print($t0+20)"):contention" --mark "$arm:ARM"
+```
+
+- `--mark "<epoch_seconds>:<label>"` (repeatable) draws a vertical line on
+  every panel, labeled above the top panel.
+- `--t0-epoch` sets the x-axis origin; without it the origin is the first
+  replica sample minus 5 s.
+- `--run-data` takes a glob for multi-replica runs
+  (`'data/<run>/run_data-*.json'`).
+- Output lands in `results/real_run_<label>.png`.
+
+Data comes off node-0 per the server-side runbook:
+`dsb_hd_counter/hotelReservation/noisy-neighbors/stage3-eval/README.md`
+(model → image → configs → batch run → data pull).
