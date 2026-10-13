@@ -29,6 +29,7 @@ import (
 
 	"github.com/coding-workspace/simple-mitigation-1/pkg/actuators"
 	"github.com/coding-workspace/simple-mitigation-1/pkg/actuators/harvest"
+	"github.com/coding-workspace/simple-mitigation-1/pkg/actuators/hc"
 	"github.com/coding-workspace/simple-mitigation-1/pkg/actuators/horizontal"
 	"github.com/coding-workspace/simple-mitigation-1/pkg/actuators/isolate"
 	"github.com/coding-workspace/simple-mitigation-1/pkg/actuators/vertical"
@@ -159,11 +160,17 @@ func main() {
 		logger.Error("harvest actuator", "err", err)
 		os.Exit(2)
 	}
+	hcAct, err := hc.New(kclient, cfg.nodeName, nil, logger)
+	if err != nil {
+		logger.Error("hc actuator", "err", err)
+		os.Exit(2)
+	}
 	registry := map[string]actuators.Actuator{
 		verticalAct.Name():   verticalAct,
 		horizontalAct.Name(): horizontalAct,
 		isolateAct.Name():    isolateAct,
 		harvestAct.Name():    harvestAct,
+		hcAct.Name():         hcAct,
 	}
 	// Run startup reconcile before the first tick.
 	for name, act := range registry {

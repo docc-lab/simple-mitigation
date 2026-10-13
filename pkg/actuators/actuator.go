@@ -1,8 +1,8 @@
 // Package actuators defines the shared interface every concrete mitigation
-// actuator (isolate, vertical, horizontal) implements. The controller's
+// actuator (isolate, vertical, horizontal, hc) implements. The controller's
 // dispatcher only ever speaks to this interface; rule kind strings
-// ("isolate", "vertical", "horizontal", "restore") are mapped to actuator
-// instances at controller startup.
+// ("isolate", "vertical", "horizontal", "hc", "restore") are mapped to
+// actuator instances at controller startup.
 package actuators
 
 import (
@@ -84,4 +84,15 @@ const (
 
 	AnnDeployHorizLastScaledAt = "mitigation/horizontal-last-scaled-at"
 	AnnDeployHorizBaseline     = "mitigation/horizontal-baseline-replicas"
+
+	// HarvestContainers (hc) annotations. The victim pods carry the cpulist
+	// registered as HC's Primary and the UIDs registered as Secondaries; each
+	// aggressor pod carries its containers' original cpuset.cpus (a JSON map
+	// of cgroup dir -> original, where "" means "inherit").
+	AnnHCApplied         = "mitigation/hc-applied"
+	AnnHCSecondaries     = "mitigation/hc-secondaries"
+	AnnHCSetByNode       = "mitigation/hc-set-by-node"
+	AnnHCSetAt           = "mitigation/hc-set-at"
+	AnnHCCpusetOriginal  = "mitigation/hc-cpuset-original"
+	AnnHCCpusetSetByNode = "mitigation/hc-cpuset-set-by-node"
 )

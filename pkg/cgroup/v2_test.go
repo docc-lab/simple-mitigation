@@ -104,3 +104,31 @@ func replaceDashWithUnderscore(s string) string {
 	}
 	return string(out)
 }
+
+func TestCpusetAndIDListRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	r := &Resolver{CgroupRoot: dir}
+	if err := os.WriteFile(filepath.Join(dir, "cpuset.cpus"), []byte("\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	got, err := r.ReadCpusetCpus(dir)
+	if err != nil || got != "" {
+		t.Fatalf("ReadCpusetCpus empty = %q, %v", got, err)
+	}
+	if err := r.WriteCpusetCpus(dir, "18-24"); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := r.ReadCpusetCpus(dir); got != "18-24" {
+		t.Fatalf("ReadCpusetCpus = %q, want 18-24", got)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "cgroup.threads"), []byte("10\n11\n12\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	ids, err := r.ReadThreads(dir)
+	if err != nil || len(ids) != 3 || ids[2] != 12 {
+		t.Fatalf("ReadThreads = %v, %v", ids, err)
+	}
+	if _, err := r.ReadProcs(dir); err == nil {
+		t.Fatal("ReadProcs on missing file: expected error")
+	}
+}

@@ -210,3 +210,52 @@ func min(a, b int) int {
 	}
 	return b
 }
+
+// ReadCpusetCpus returns the raw contents of cpuset.cpus, trimmed. In cgroup
+// v2 an empty file is meaningful -- it means "inherit the parent's effective
+// set" -- so callers that save and restore it must round-trip "" exactly
+// rather than treating it as an error.
+func (r *Resolver) ReadCpusetCpus(cgroupDir string) (string, error) {
+	raw, err := os.ReadFile(filepath.Join(cgroupDir, "cpuset.cpus"))
+	if err != nil {
+		return "", fmt.Errorf("cgroup: read cpuset.cpus: %w", err)
+	}
+	return strings.TrimSpace(string(raw)), nil
+}
+
+// WriteCpusetCpus overwrites cpuset.cpus. Writing "" restores inheritance.
+// The kernel rejects a set that is not a subset of the parent's effective
+// cpus, so a failed write leaves the cgroup unchanged.
+func (r *Resolver) WriteCpusetCpus(cgroupDir, cpus string) error {
+	if err := os.WriteFile(filepath.Join(cgroupDir, "cpuset.cpus"), []byte(cpus+"\n"), 0644); err != nil {
+		return fmt.Errorf("cgroup: write cpuset.cpus: %w", err)
+	}
+	return nil
+}
+
+// ReadProcs returns the PIDs listed in cgroup.procs.
+func (r *Resolver) ReadProcs(cgroupDir string) ([]int, error) {
+	return readIDList(filepath.Join(cgroupDir, "cgroup.procs"))
+}
+
+// ReadThreads returns the TIDs listed in cgroup.threads -- every thread, not
+// just thread-group leaders, which is what per-thread affinity calls need.
+func (r *Resolver) ReadThreads(cgroupDir string) ([]int, error) {
+	return readIDList(filepath.Join(cgroupDir, "cgroup.threads"))
+}
+
+func readIDList(path string) ([]int, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("cgroup: read %s: %w", filepath.Base(path), err)
+	}
+	var ids []int
+	for _, f := range strings.Fields(string(raw)) {
+		id, err := strconv.Atoi(f)
+		if err != nil {
+			return nil, fmt.Errorf("cgroup: parse %s entry %q: %w", filepath.Base(path), f, err)
+		}
+		ids = append(ids, id)
+	}
+	return ids, nil
+}

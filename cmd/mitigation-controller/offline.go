@@ -79,7 +79,7 @@ func runOffline(ctx context.Context, cfg *runtimeConfig, tcfg *targets.Config,
 	engine *policy.Engine, logger *slog.Logger, addrs map[string]string) {
 
 	registry := map[string]actuators.Actuator{}
-	for _, kind := range []string{"isolate", "vertical", "horizontal", "harvest"} {
+	for _, kind := range []string{"isolate", "vertical", "horizontal", "harvest", "hc"} {
 		registry[kind] = &dryRunActuator{kind: kind, logger: logger}
 	}
 

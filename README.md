@@ -10,6 +10,7 @@ policy each tick, and fires one of three mitigation tiers:
 | `harvest`    | cgroup v2 `cpu.max` on co-located best-effort pods |  ~100 ms  | `pkg/actuators/harvest`  |
 | `vertical`   | `pods/resize` subresource (cpu requests/limits) |   ~1 s    | `pkg/actuators/vertical` |
 | `horizontal` | `apps/v1.Deployment/scale` subresource          |  ~10 s+   | `pkg/actuators/horizontal` |
+| `hc`         | HarvestContainers: aggressors confined to dedicated cores + idle victim cores (host Listener/Balancer) | ~1 s | `pkg/actuators/hc` |
 
 The binary runs as a privileged `DaemonSet` -- one instance per node. Each
 instance subscribes only to victim pods on its own node (field selector
@@ -259,6 +260,7 @@ Two helper functions are registered:
 | `harvest`    | `be_selector` (req), `harvest_cores` (req, cores to lend on top of baseline). Optional `be_namespace`, `period_us`, `max_quota_us`. |
 | `vertical`   | `scale_factor` (multiplicative) **or** `target_cpu` (absolute, e.g. `"750m"`). Clamped to `MIN_CPU`/`MAX_CPU`. |
 | `horizontal` | exactly one of `delta` (additive) or `ensure_min` (idempotent floor); optional `min_replicas`/`max_replicas`. |
+| `hc`         | `aggressor_selector` (req), `secondary_cpulist` (req, aggressors' dedicated cores). Optional `aggressor_namespace` (`"*"` = all), `victim_cpulist` (default: union of the victim tasks' `Cpus_allowed_list`), `target_idle_cores` (1, must be < victim cores), `acbf` (0.33), `low_tic` (1), `min_secondary_cores` (0), `balancer_cpu` (30), `listener_addr` (`127.0.0.1:10101`), `hc_bin_dir`, `log_dir`. Needs the HC module + `hc-listener.service` on the node and a root host process; see `deploy/controller/policy-hc-example.yaml`. |
 | `restore`    | meta-kind; fans out to every actuator's `Restore()`. |
 
 The absolute-cap mode on `isolate` and the `harvest` kind are the actuation
@@ -400,6 +402,8 @@ Every action stamps annotations on its target *before* the actual write so
 | Best-effort Pod      | `mitigation/harvest-cpu-max-original`, `mitigation/harvest-set-by-node`, `mitigation/harvest-set-at` |
 | Victim Pod           | `mitigation/cpu-limit-baseline`                                                              |
 | Victim Deployment    | `mitigation/horizontal-last-scaled-at`, `mitigation/horizontal-baseline-replicas`            |
+| Victim Pod (hc)      | `mitigation/hc-applied` (Primary cpulist), `mitigation/hc-secondaries`, `mitigation/hc-set-by-node`, `mitigation/hc-set-at` |
+| Aggressor Pod (hc)   | `mitigation/hc-cpuset-original` (JSON: cgroup dir -> original `cpuset.cpus`), `mitigation/hc-cpuset-set-by-node` |
 
 No extra storage backend (etcd, Redis, the controller's own CRD) is needed;
 the API server is the source of truth.
