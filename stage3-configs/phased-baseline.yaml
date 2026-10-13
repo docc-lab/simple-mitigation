@@ -1,0 +1,31 @@
+# Stage 3 PHASED sweep — BASELINE (no contention reference)
+#
+# Same phased 140 s frame as the contention configs, but with ZERO
+# aggressors and no SN/SS load: the victim runs alone at 2400 rps the whole
+# time. Mitigation still ARMS at t0+80 s but nothing crosses a threshold, so
+# neither actuator fires. This is the eval.2 "no-contention" reference
+# subfigure — flat latency, flat scores, n stays 1, cores stay at c_base.
+#
+# Timeline (single 140 s run):
+#   p1  0-20 s   victim only @ 2400 rps
+#   p2 20-80 s   still victim only (no contention introduced)
+#   p3 80-140 s  mitigation armed, nothing to mitigate
+#
+# Run via the phase orchestrator, not stage3-eval.sh directly.
+
+experiment:
+  name: phased-baseline
+  duration_s: 140
+  warmup_s: 30
+  cooldown_s: 30
+  runs: 1
+  target_node: node-4
+testbeds:
+  hotelReservation:
+    loadgen: {rps: 2400, shape: exp}   # victim load -- fixed, no contention
+victim:
+  testbed: hotelReservation
+  service: search
+  image: docclabgroup/search-online:v2.3.0
+  score_log: true
+aggressors: []

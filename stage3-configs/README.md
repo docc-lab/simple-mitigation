@@ -24,15 +24,19 @@ Full pipeline: see `../STAGE3-RUNBOOK.md`.
 - **intrinsic** (`int-*`): victim baseline 800 rps; a second wrk2 driver adds
   load from +20 s (→ 2200 moderate / 2400 severe). Co-tenant pods are deployed
   but **unloaded** (`rps: 0`). Contention comes from the victim's own overload.
-- **steady** = `fixed` inter-arrival, **bursty** = `exp` (Poisson).
+- **steady** = `fixed` inter-arrival, **bursty** = `exp` (Poisson). Note that
+  both are *continuous* for the whole window — "bursty" here means jittery
+  arrivals, not contention that arrives and leaves.
 - **moderate/severe** = SN 5200/SS 6100 vs SN 5400/SS 6300 (extrinsic);
   →2200 vs →2400 rps (intrinsic).
 
-## What the sweep validated (2026-07-14, e_horz control stack)
+## What the sweep validated (2026-07-14, i_horz control stack)
 
 Horizontal scaling is gated on the **intrinsic-weighted** signal
-`e_horz = y50·(1−ext50)` (θ_on 0.40 / θ_off 0.15, 8 s scale-down dwell);
-isolation on the **extrinsic-weighted** `e_iso = y90·ext90`. Result:
+`i_horz = y50·(1−ext50)` (θ_on 0.40 / θ_off 0.15, with a consecutive-window
+persistence filter — 3 windows up / 30 down — so single burst spikes don't
+scale); isolation on the **extrinsic-weighted** `e_iso = y90·ext90` (PI, k_i
+drives e_iso → θ_ref). Result:
 
 | arm | horiz steps | max n | e_iso p2 | reading |
 |-----|-------------|-------|----------|---------|

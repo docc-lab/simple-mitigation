@@ -50,8 +50,15 @@ type formulaConfig struct {
 	nMax     int     // Eq.1 n_max
 	thetaRef float64 // Eq.2 θ_ref
 	kP       float64 // Eq.2 k_p (cores per unit score)
-	capBase  float64 // Eq.2 c_base (total cores)
-	capMin   float64 // Eq.2 c_min (total cores; static lower clamp)
+	// kI adds an integral term to Eq.(2): a pure-P law settles with a
+	// steady-state offset (e_iso parks above θ_ref and never reaches it);
+	// the integral accumulates that persistent error and keeps returning
+	// cores until e_iso → θ_ref. kI=0 disables it (pure-P, the original).
+	// Conditional-integration anti-windup freezes the accumulator whenever
+	// the cap saturates at c_min/c_base.
+	kI      float64
+	capBase float64 // Eq.2 c_base (total cores)
+	capMin  float64 // Eq.2 c_min (total cores; static lower clamp)
 	// minPerPod > 0 makes the floor dynamic in the aggressor count: the
 	// actuator never squeezes a pod below this, so the effective aggregate
 	// floor is minPerPod x N(matched pods).
@@ -61,12 +68,13 @@ type formulaConfig struct {
 	// (equivalent to prediction-off semantics enforced controller-side).
 	yhatFromCurrent bool
 	// horzFromExt drives Eq.(1) from the INTRINSIC-weighted signal
-	// e_horz = y50·(1−ext50) instead of raw y50/ŷ50. Horizontal scaling
+	// i_horz = y50·(1−ext50) instead of raw y50/ŷ50. Horizontal scaling
 	// adds capacity, so it can only mitigate load-induced (intrinsic)
 	// pressure; raw y50 cannot attribute the excess and false-positively
 	// scales out under extrinsic interference (isolation's job) while
 	// never earning scale-down credit once intrinsic pressure is relieved.
-	// e_horz is the mirror image of Eq.(2)'s e_iso = y90·ext90.
+	// i_horz (intrinsic-weighted) is the mirror image of Eq.(2)'s e_iso =
+	// y90·ext90 (extrinsic-weighted).
 	// Thresholds move to horzThetaOn/Off (HORZ_THETA_ON/HORZ_THETA_OFF,
 	// default THETA_ON/THETA_OFF): the product signal lives on a smaller
 	// scale than raw y50.
@@ -81,11 +89,16 @@ type formulaConfig struct {
 	// replica and spread the rest; two can. Empty = scale the target's own
 	// deployment (min 1), the original behavior.
 	horizontalDeployment string
-	// horzDownDwell requires e_horz to stay below θ_off continuously for
-	// this long before u=-1 fires (HORZ_DOWN_DWELL_SEC, default 8s).
-	// Scale-up stays immediate: bursty load makes the intrinsic channel
-	// spiky, and an up->down flap within seconds churns pods for nothing.
-	horzDownDwell time.Duration
+	// Consecutive-window persistence for Eq.(1). The intrinsic channel is
+	// spiky under bursty load, so a single window over θ_on must NOT scale
+	// out; only a SUSTAINED crossing does. Scale-up fires after the up
+	// signal exceeds θ_on for horzUpWindows consecutive windows; scale-down
+	// after the down signal stays below θ_off for horzDownWindows. Because
+	// the up signal is ŷ50-based when the predictor is on, a run of
+	// exceedances means "predicted overloaded for N windows" — the
+	// prediction lets the run accumulate a window earlier (anticipation).
+	horzUpWindows   int
+	horzDownWindows int
 	// armFile, when set (FORMULA_ARM_FILE), gates ACTUATION on the file's
 	// existence: the controller senses, computes, and traces from startup,
 	// but dispatches nothing until the file appears. Gives phased
@@ -116,36 +129,38 @@ func loadFormulaConfig() *formulaConfig {
 	thetaOn := envFloat("THETA_ON", 0.3)
 	thetaOff := envFloat("THETA_OFF", 0.1)
 	return &formulaConfig{
-		thetaOn:            thetaOn,
-		thetaOff:           thetaOff,
-		horzFromExt:        os.Getenv("HORZ_FROM_EXT") == "1",
-		horzThetaOn:        envFloat("HORZ_THETA_ON", thetaOn),
-		horzThetaOff:       envFloat("HORZ_THETA_OFF", thetaOff),
+		thetaOn:              thetaOn,
+		thetaOff:             thetaOff,
+		horzFromExt:          os.Getenv("HORZ_FROM_EXT") == "1",
+		horzThetaOn:          envFloat("HORZ_THETA_ON", thetaOn),
+		horzThetaOff:         envFloat("HORZ_THETA_OFF", thetaOff),
 		horizontalDeployment: os.Getenv("HORIZONTAL_DEPLOYMENT"),
-		horzDownDwell:        time.Duration(envFloat("HORZ_DOWN_DWELL_SEC", 8) * float64(time.Second)),
-		nMax:               envInt("N_MAX", 10),
-		thetaRef:           envFloat("THETA_REF", 0.3),
-		kP:                 envFloat("K_P", 6.4),
-		capBase:            envFloat("CAP_BASE_CORES", 4.0),
-		capMin:             envFloat("CAP_MIN_CORES", 0.5),
-		minPerPod:          envFloat("CAP_MIN_PER_POD_CORES", 0),
-		yhatFromCurrent:    os.Getenv("YHAT_FROM_CURRENT") == "1",
-		armFile:            os.Getenv("FORMULA_ARM_FILE"),
-		guaranteeDefault:   envFloat("AGGRESSOR_GUARANTEE_CORES", 0),
-		guaranteeHR:        envFloat("AGGRESSOR_GUARANTEE_HR_CORES", 0),
-		guaranteeHRNs:      envStr("AGGRESSOR_GUARANTEE_HR_NS", "default"),
-		capQuantum:         envFloat("CAP_QUANTUM_CORES", 0.25),
-		capHysteresis:      envFloat("CAP_HYSTERESIS_FRACTION", 0.75),
-		aggressorSelector:  envStr("AGGRESSOR_SELECTOR", "tier=batch"),
-		aggressorNamespace: os.Getenv("AGGRESSOR_NAMESPACE"),
-		periodUs:           envInt("ISOLATE_PERIOD_US", 100000),
+		horzUpWindows:        envInt("HORZ_UP_WINDOWS", 3),
+		horzDownWindows:      envInt("HORZ_DOWN_WINDOWS", 30),
+		nMax:                 envInt("N_MAX", 10),
+		thetaRef:             envFloat("THETA_REF", 0.3),
+		kP:                   envFloat("K_P", 6.4),
+		kI:                   envFloat("K_I", 0),
+		capBase:              envFloat("CAP_BASE_CORES", 4.0),
+		capMin:               envFloat("CAP_MIN_CORES", 0.5),
+		minPerPod:            envFloat("CAP_MIN_PER_POD_CORES", 0),
+		yhatFromCurrent:      os.Getenv("YHAT_FROM_CURRENT") == "1",
+		armFile:              os.Getenv("FORMULA_ARM_FILE"),
+		guaranteeDefault:     envFloat("AGGRESSOR_GUARANTEE_CORES", 0),
+		guaranteeHR:          envFloat("AGGRESSOR_GUARANTEE_HR_CORES", 0),
+		guaranteeHRNs:        envStr("AGGRESSOR_GUARANTEE_HR_NS", "default"),
+		capQuantum:           envFloat("CAP_QUANTUM_CORES", 0.25),
+		capHysteresis:        envFloat("CAP_HYSTERESIS_FRACTION", 0.75),
+		aggressorSelector:    envStr("AGGRESSOR_SELECTOR", "tier=batch"),
+		aggressorNamespace:   os.Getenv("AGGRESSOR_NAMESPACE"),
+		periodUs:             envInt("ISOLATE_PERIOD_US", 100000),
 	}
 }
 
 func (f *formulaConfig) logAttrs() []any {
 	return []any{
 		"theta_on", f.thetaOn, "theta_off", f.thetaOff, "n_max", f.nMax,
-		"theta_ref", f.thetaRef, "k_p", f.kP,
+		"theta_ref", f.thetaRef, "k_p", f.kP, "k_i", f.kI,
 		"cap_base", f.capBase, "cap_min", f.capMin,
 		"min_per_pod", f.minPerPod,
 		"cap_quantum", f.capQuantum,
@@ -153,7 +168,7 @@ func (f *formulaConfig) logAttrs() []any {
 		"horz_from_ext", f.horzFromExt,
 		"horz_theta_on", f.horzThetaOn, "horz_theta_off", f.horzThetaOff,
 		"horizontal_deployment", f.horizontalDeployment,
-		"horz_down_dwell", f.horzDownDwell,
+		"horz_up_windows", f.horzUpWindows, "horz_down_windows", f.horzDownWindows,
 	}
 }
 
@@ -167,10 +182,14 @@ type formulaState struct {
 	// armed latches true once the arm file appears (or immediately when no
 	// arm file is configured).
 	armed bool
-	// belowSince marks when the scale-down signal first dropped below
-	// θ_off; zero while the signal sits above it. u=-1 needs the signal
-	// below θ_off for horzDownDwell continuously.
-	belowSince time.Time
+	// upRun / downRun count consecutive windows the scale-up / scale-down
+	// condition has held, for the persistence filter (Eq.1). Reset to 0 the
+	// moment the condition breaks or a step fires.
+	upRun   int
+	downRun int
+	// integralIso is Eq.(2)'s PI accumulator (∫(e_iso − θ_ref) dt), frozen
+	// under saturation for anti-windup. Unused when kI = 0.
+	integralIso float64
 }
 
 // checkArmed reports whether actuation is enabled, latching on first sight
@@ -271,26 +290,33 @@ func (c *controller) formulaTick(ctx context.Context, jobs []tickJob) {
 		hOn, hOff = f.horzThetaOn, f.horzThetaOff
 	}
 
-	// Scale-down dwell: the intrinsic channel is spiky under bursty load;
-	// require the signal to HOLD below θ_off before shedding a replica.
-	// Scale-up stays immediate.
-	nowT := time.Now()
-	if downSig < hOff && upSig < hOn {
-		if c.fstate.belowSince.IsZero() {
-			c.fstate.belowSince = nowT
-		}
+	// Consecutive-window persistence (Eq.1). A single window over θ_on is a
+	// burst spike and must not scale out; only a run of horzUpWindows does.
+	// Symmetrically, scale in only after horzDownWindows below θ_off. This
+	// filters the intrinsic channel's burst spikes and — because commands
+	// are now paced to sustained crossings — also stops syncN from fighting
+	// in-flight scale ops. Prediction feeds in via upSig (ŷ50-based when the
+	// predictor is on), so a run of exceedances is a forward-looking
+	// "predicted overloaded for N windows".
+	if upSig > hOn {
+		c.fstate.upRun++
 	} else {
-		c.fstate.belowSince = time.Time{}
+		c.fstate.upRun = 0
 	}
-	dwellMet := !c.fstate.belowSince.IsZero() &&
-		nowT.Sub(c.fstate.belowSince) >= f.horzDownDwell
+	if downSig < hOff && upSig < hOn {
+		c.fstate.downRun++
+	} else {
+		c.fstate.downRun = 0
+	}
 
 	u := 0
 	switch {
-	case upSig > hOn && c.fstate.n < f.nMax:
+	case c.fstate.upRun >= f.horzUpWindows && c.fstate.n < f.nMax:
 		u = +1
-	case dwellMet && c.fstate.n > 0:
+		c.fstate.upRun = 0 // require a fresh run before the next step-out
+	case c.fstate.downRun >= f.horzDownWindows && c.fstate.n > 0:
 		u = -1
+		c.fstate.downRun = 0
 	}
 	if u != 0 && armed {
 		c.fstate.n += u
@@ -317,13 +343,30 @@ func (c *controller) formulaTick(ctx context.Context, jobs []tickJob) {
 			"yhat50", fmt.Sprintf("%.3f", yhat),
 			"y50", fmt.Sprintf("%.3f", ynow),
 			"ext50", fmt.Sprintf("%.3f", ext50),
-			"e_horz", fmt.Sprintf("%.3f", downSig))
+			"i_horz", fmt.Sprintf("%.3f", downSig))
 	}
 
 	// ── Eq. (2): isolation, one cap per pod per tick ──
+	// PI integral is updated once per tick on the mean e_iso (isolation only
+	// fires single-victim-pod, so mean == the pod's value there). Conditional
+	// integration: accumulate only while the unsaturated cap is within
+	// (c_min, c_base) — freeze it at the rails so it can't wind up.
+	const isoTickSec = 0.1 // controller tick period; k_i is tuned to it
+	if f.kI > 0 && armed && len(jobs) > 0 {
+		var meanEiso float64
+		for _, j := range jobs {
+			meanEiso += j.fv.TailNow * j.fv.ExtPct90
+		}
+		meanEiso /= float64(len(jobs))
+		errI := meanEiso - f.thetaRef
+		trial := f.capBase - f.kP*errI - f.kI*(c.fstate.integralIso+errI*isoTickSec)
+		if trial > f.capMin && trial < f.capBase {
+			c.fstate.integralIso += errI * isoTickSec
+		}
+	}
 	for _, j := range jobs {
 		eIso := j.fv.TailNow * j.fv.ExtPct90 // e_iso = y90 · %ext,90
-		cap := f.capBase - f.kP*(eIso-f.thetaRef)
+		cap := f.capBase - f.kP*(eIso-f.thetaRef) - f.kI*c.fstate.integralIso
 		cap = math.Min(f.capBase, math.Max(f.capMin, cap))
 		last, seen := c.fstate.lastCap[j.podName]
 		if !seen {
@@ -332,11 +375,11 @@ func (c *controller) formulaTick(ctx context.Context, jobs []tickJob) {
 		// Score trace: one CSV row per replica per tick, so mitigated runs
 		// keep the full per-replica score curves alongside controller state.
 		if tf := c.cfg.scoreTrace; tf != nil {
-			eHorz := j.fv.Y50Current * (1 - j.fv.ExtPct50)
+			iHorz := j.fv.Y50Current * (1 - j.fv.ExtPct50) // intrinsic-weighted
 			fmt.Fprintf(tf, "%d,%s,%s,%.4f,%.4f,%.4f,%.4f,%.4f,%d,%.2f,%.4f,%.4f\n",
 				time.Now().UnixMilli(), c.target.Name, j.podName,
 				j.fv.P50Now, j.fv.Y50Current, j.fv.TailNow, j.fv.ExtPct90,
-				eIso, c.fstate.n, last, j.fv.ExtPct50, eHorz)
+				eIso, c.fstate.n, last, j.fv.ExtPct50, iHorz)
 		}
 		// Quantize + hysteresis so score noise straddling a quantum boundary
 		// does not flap between adjacent caps. This bounds steady-state write
@@ -364,14 +407,14 @@ func (c *controller) formulaTick(ctx context.Context, jobs []tickJob) {
 			Pod:      j.podName,
 			Kind:     "isolate",
 			Params: map[string]any{
-				"cap_total_cores":       q,
-				"min_per_pod_cores":     f.minPerPod,
-				"guarantee_cores":       f.guaranteeDefault,
-				"guarantee_hr_cores":    f.guaranteeHR,
-				"guarantee_hr_ns":       f.guaranteeHRNs,
-				"period_us":             f.periodUs,
-				"aggressor_selector":    f.aggressorSelector,
-				"aggressor_namespace":   f.aggressorNamespace,
+				"cap_total_cores":     q,
+				"min_per_pod_cores":   f.minPerPod,
+				"guarantee_cores":     f.guaranteeDefault,
+				"guarantee_hr_cores":  f.guaranteeHR,
+				"guarantee_hr_ns":     f.guaranteeHRNs,
+				"period_us":           f.periodUs,
+				"aggressor_selector":  f.aggressorSelector,
+				"aggressor_namespace": f.aggressorNamespace,
 			},
 		}, j.podName, j.nodeName)
 		c.logger.Info("formula: isolation cap",
