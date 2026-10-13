@@ -10,7 +10,7 @@
 #     Cpus_allowed_list unless victim_cpulist is given
 rules:
   - name: extrinsic_tail_contention
-    # Same trigger column-eval's ext90 signal uses.
+    # Fire on the victim's p90 tail score.
     when: "tail_now > 0.35"
     fire:
       - kind: hc
