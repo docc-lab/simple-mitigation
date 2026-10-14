@@ -55,7 +55,7 @@ import (
 const (
 	DefaultBinDir      = "/local/HarvestContainers/TestFramework/bin"
 	DefaultLogDir      = "/mnt/extra/logs/hc"
-	DefaultBalancerCPU = 30
+	DefaultBalancerCPU = 14
 	DefaultACBF        = 0.33 // HC's xapian value; tune per victim
 	DefaultLowTIC      = 1
 	DefaultTargetIdle  = 1
@@ -210,7 +210,7 @@ func parseParams(target actuators.Target, params map[string]any) (applyParams, e
 //	low_tic: int                 floor for the dynamic target (default 1)
 //	acbf: float                  LOWIDLEFREQ_THRESHOLD (default 0.33)
 //	min_secondary_cores: int     default 0
-//	balancer_cpu: int            core the Balancer is pinned to (default 30)
+//	balancer_cpu: int            core the Balancer is pinned to (default 14)
 //	listener_addr, hc_bin_dir, log_dir: host plumbing, see defaults above
 //
 // Re-applying while held is cheap and idempotent: only aggressor pods that

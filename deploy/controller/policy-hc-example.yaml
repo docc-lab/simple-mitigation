@@ -17,11 +17,11 @@ rules:
         params:
           aggressor_selector: "gordion-aggr=true"
           aggressor_namespace: "*"
-          secondary_cpulist: "21-24"   # aggressors' dedicated cores
+          secondary_cpulist: "5-8"     # aggressors' dedicated cores (sm110p, nosmt)
           target_idle_cores: 1         # must be < number of victim cores
           acbf: 0.33                   # LOWIDLEFREQ_THRESHOLD
           low_tic: 1
-          balancer_cpu: 30
+          balancer_cpu: 14
     cooldown: "5s"
     priority: 100
 

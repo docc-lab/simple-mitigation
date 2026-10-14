@@ -37,6 +37,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/coding-workspace/simple-mitigation-1/pkg/actuators"
 	"github.com/coding-workspace/simple-mitigation-1/pkg/policy"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -119,6 +120,28 @@ type formulaConfig struct {
 	aggressorSelector  string
 	aggressorNamespace string
 	periodUs           int
+
+	// isoActuator picks what Eq.(2)'s extrinsic channel drives
+	// (ISO_ACTUATOR): "isolate" (default; the cpu.max budget c(t)), "hc"
+	// (HarvestContainers held on/off with hysteresis on e_iso, see hcTick),
+	// or "none" (trace only; Eq.(1) still runs).
+	isoActuator string
+	hc          hcFormulaConfig
+}
+
+// hcFormulaConfig drives the hc actuator from e_iso. HC is not a dial like
+// c(t): Apply confines the aggressors to their dedicated cores plus whatever
+// victim cores are idle, Restore releases them. So Eq.(2)'s proportional law
+// becomes a bang-bang with persistence, mirroring Eq.(1)'s up/down windows.
+type hcFormulaConfig struct {
+	thetaOn     float64 // Apply after e_iso > thetaOn for upWindows ticks
+	thetaOff    float64 // Restore after e_iso < thetaOff for downWindows ticks
+	upWindows   int
+	downWindows int
+	// reapply re-sends Apply while held, so aggressor pods that appear later
+	// (rollouts, scale-out) are registered too. Apply is idempotent.
+	reapply time.Duration
+	params  map[string]any
 }
 
 func loadFormulaConfig() *formulaConfig {
@@ -128,7 +151,7 @@ func loadFormulaConfig() *formulaConfig {
 	}
 	thetaOn := envFloat("THETA_ON", 0.3)
 	thetaOff := envFloat("THETA_OFF", 0.1)
-	return &formulaConfig{
+	f := &formulaConfig{
 		thetaOn:              thetaOn,
 		thetaOff:             thetaOff,
 		horzFromExt:          os.Getenv("HORZ_FROM_EXT") == "1",
@@ -154,11 +177,54 @@ func loadFormulaConfig() *formulaConfig {
 		aggressorSelector:    envStr("AGGRESSOR_SELECTOR", "tier=batch"),
 		aggressorNamespace:   os.Getenv("AGGRESSOR_NAMESPACE"),
 		periodUs:             envInt("ISOLATE_PERIOD_US", 100000),
+		isoActuator:          envStr("ISO_ACTUATOR", "isolate"),
 	}
+	if f.isoActuator == "hc" {
+		params := map[string]any{
+			"secondary_cpulist":   envStr("HC_SECONDARY_CPULIST", ""),
+			"victim_cpulist":      envStr("HC_VICTIM_CPULIST", ""),
+			"target_idle_cores":   envInt("HC_TARGET_IDLE_CORES", 1),
+			"low_tic":             envInt("HC_LOW_TIC", 1),
+			"acbf":                envFloat("HC_ACBF", 0.33),
+			"min_secondary_cores": envInt("HC_MIN_SECONDARY_CORES", 0),
+			"balancer_cpu":        envInt("HC_BALANCER_CPU", 14),
+			"aggressor_selector":  f.aggressorSelector,
+		}
+		if f.aggressorNamespace != "" {
+			params["aggressor_namespace"] = f.aggressorNamespace
+		}
+		f.hc = hcFormulaConfig{
+			thetaOn:     envFloat("HC_THETA_ON", f.thetaRef),
+			thetaOff:    envFloat("HC_THETA_OFF", thetaOff),
+			upWindows:   envInt("HC_UP_WINDOWS", 3),
+			downWindows: envInt("HC_DOWN_WINDOWS", 30),
+			reapply:     time.Duration(envInt("HC_REAPPLY_MS", 5000)) * time.Millisecond,
+			params:      params,
+		}
+	}
+	return f
+}
+
+// validate rejects settings the tick loop cannot act on, so a typo fails at
+// startup instead of silently running the wrong arm.
+func (f *formulaConfig) validate() error {
+	switch f.isoActuator {
+	case "isolate", "none":
+	case "hc":
+		if f.hc.params["secondary_cpulist"] == "" {
+			return fmt.Errorf("ISO_ACTUATOR=hc requires HC_SECONDARY_CPULIST")
+		}
+		if f.hc.thetaOff >= f.hc.thetaOn {
+			return fmt.Errorf("HC_THETA_OFF (%g) must be < HC_THETA_ON (%g)", f.hc.thetaOff, f.hc.thetaOn)
+		}
+	default:
+		return fmt.Errorf("ISO_ACTUATOR=%q: want isolate, hc or none", f.isoActuator)
+	}
+	return nil
 }
 
 func (f *formulaConfig) logAttrs() []any {
-	return []any{
+	attrs := []any{
 		"theta_on", f.thetaOn, "theta_off", f.thetaOff, "n_max", f.nMax,
 		"theta_ref", f.thetaRef, "k_p", f.kP, "k_i", f.kI,
 		"cap_base", f.capBase, "cap_min", f.capMin,
@@ -169,7 +235,15 @@ func (f *formulaConfig) logAttrs() []any {
 		"horz_theta_on", f.horzThetaOn, "horz_theta_off", f.horzThetaOff,
 		"horizontal_deployment", f.horizontalDeployment,
 		"horz_up_windows", f.horzUpWindows, "horz_down_windows", f.horzDownWindows,
+		"iso_actuator", f.isoActuator,
 	}
+	if f.isoActuator == "hc" {
+		attrs = append(attrs,
+			"hc_theta_on", f.hc.thetaOn, "hc_theta_off", f.hc.thetaOff,
+			"hc_up_windows", f.hc.upWindows, "hc_down_windows", f.hc.downWindows,
+			"hc_params", f.hc.params)
+	}
+	return attrs
 }
 
 // formulaState is per-target controller state. It lives on the controller
@@ -190,6 +264,12 @@ type formulaState struct {
 	// integralIso is Eq.(2)'s PI accumulator (∫(e_iso − θ_ref) dt), frozen
 	// under saturation for anti-windup. Unused when kI = 0.
 	integralIso float64
+	// ISO_ACTUATOR=hc state: whether HC is applied, the persistence runs on
+	// e_iso, and when Apply was last sent (for re-registration).
+	hcHeld      bool
+	hcUpRun     int
+	hcDownRun   int
+	hcLastApply time.Time
 }
 
 // checkArmed reports whether actuation is enabled, latching on first sight
@@ -346,6 +426,11 @@ func (c *controller) formulaTick(ctx context.Context, jobs []tickJob) {
 			"i_horz", fmt.Sprintf("%.3f", downSig))
 	}
 
+	if f.isoActuator != "isolate" {
+		c.isoAltTick(ctx, f, jobs, armed)
+		return
+	}
+
 	// ── Eq. (2): isolation, one cap per pod per tick ──
 	// PI integral is updated once per tick on the mean e_iso (isolation only
 	// fires single-victim-pod, so mean == the pod's value there). Conditional
@@ -420,5 +505,100 @@ func (c *controller) formulaTick(ctx context.Context, jobs []tickJob) {
 		c.logger.Info("formula: isolation cap",
 			"pod", j.podName, "e_iso", fmt.Sprintf("%.3f", eIso),
 			"cap_total_cores", q, "prev", last)
+	}
+}
+
+// isoAltTick runs the extrinsic channel when ISO_ACTUATOR is not "isolate".
+// The score trace keeps its columns; applied_cap carries 1/0 (HC held or
+// not) for "hc" and c_base for "none", where nothing is ever capped.
+func (c *controller) isoAltTick(ctx context.Context, f *formulaConfig, jobs []tickJob, armed bool) {
+	var meanEiso float64
+	for _, j := range jobs {
+		meanEiso += j.fv.TailNow * j.fv.ExtPct90
+	}
+	meanEiso /= float64(len(jobs))
+
+	applied := f.capBase
+	if f.isoActuator == "hc" {
+		applied = 0
+		if c.fstate.hcHeld {
+			applied = 1
+		}
+	}
+	if tf := c.cfg.scoreTrace; tf != nil {
+		for _, j := range jobs {
+			eIso := j.fv.TailNow * j.fv.ExtPct90
+			iHorz := j.fv.Y50Current * (1 - j.fv.ExtPct50)
+			fmt.Fprintf(tf, "%d,%s,%s,%.4f,%.4f,%.4f,%.4f,%.4f,%d,%.2f,%.4f,%.4f\n",
+				time.Now().UnixMilli(), c.target.Name, j.podName,
+				j.fv.P50Now, j.fv.Y50Current, j.fv.TailNow, j.fv.ExtPct90,
+				eIso, c.fstate.n, applied, j.fv.ExtPct50, iHorz)
+		}
+	}
+	if f.isoActuator == "hc" {
+		c.hcTick(ctx, f, jobs[0], meanEiso, armed)
+	}
+}
+
+// hcTick holds HC on/off with consecutive-window persistence on e_iso: Apply
+// after hc.upWindows ticks above hc.thetaOn, Restore after hc.downWindows
+// ticks below hc.thetaOff. Disarmed ticks keep counting (so arming acts on
+// the current state at once) but dispatch nothing.
+func (c *controller) hcTick(ctx context.Context, f *formulaConfig, j tickJob, eIso float64, armed bool) {
+	st := c.fstate
+	if eIso > f.hc.thetaOn {
+		st.hcUpRun++
+	} else {
+		st.hcUpRun = 0
+	}
+	if eIso < f.hc.thetaOff {
+		st.hcDownRun++
+	} else {
+		st.hcDownRun = 0
+	}
+	if !armed {
+		return
+	}
+	act, ok := c.registry["hc"]
+	if !ok {
+		c.logger.Warn("formula: hc actuator not registered")
+		return
+	}
+	tgt := actuators.Target{Spec: c.target, PodName: j.podName, NodeName: j.nodeName}
+
+	switch {
+	case !st.hcHeld && st.hcUpRun >= f.hc.upWindows:
+		st.hcUpRun = 0
+		res, err := act.Apply(ctx, tgt, f.hc.params)
+		st.hcLastApply = time.Now()
+		if err != nil {
+			c.logger.Warn("formula: hc apply failed", "e_iso", fmt.Sprintf("%.3f", eIso), "err", err)
+			return
+		}
+		// Applied=false means nothing to act on yet (no aggressors on the
+		// node); stay released and retry on the next sustained crossing.
+		st.hcHeld = res.Applied
+		c.logger.Info("formula: hc apply", "e_iso", fmt.Sprintf("%.3f", eIso),
+			"applied", res.Applied, "reason", res.Reason, "after", res.After)
+	case st.hcHeld && st.hcDownRun >= f.hc.downWindows:
+		st.hcDownRun = 0
+		if err := act.Restore(ctx, tgt); err != nil {
+			c.logger.Warn("formula: hc restore failed", "e_iso", fmt.Sprintf("%.3f", eIso), "err", err)
+			return
+		}
+		st.hcHeld = false
+		c.logger.Info("formula: hc restore", "e_iso", fmt.Sprintf("%.3f", eIso))
+	case st.hcHeld && time.Since(st.hcLastApply) >= f.hc.reapply:
+		st.hcLastApply = time.Now()
+		res, err := act.Apply(ctx, tgt, f.hc.params)
+		if err != nil {
+			c.logger.Warn("formula: hc re-apply failed", "err", err)
+			return
+		}
+		if res.After != nil {
+			if added, _ := res.After["added_pods"].([]string); len(added) > 0 {
+				c.logger.Info("formula: hc registered new aggressors", "added", added)
+			}
+		}
 	}
 }

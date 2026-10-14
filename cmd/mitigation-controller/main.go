@@ -215,6 +215,18 @@ func main() {
 	}
 
 	wg.Wait()
+	// An hc arm that is still held leaves the aggressors confined and its
+	// Balancer running after we exit; release them so the next run starts
+	// clean (Reconcile would only catch it at the next startup).
+	if cfg.formula != nil && cfg.formula.isoActuator == "hc" {
+		rctx, rcancel := context.WithTimeout(context.Background(), 30*time.Second)
+		if err := hcAct.Restore(rctx, actuators.Target{NodeName: cfg.nodeName}); err != nil {
+			logger.Warn("hc restore on shutdown failed", "err", err)
+		} else {
+			logger.Info("hc restored on shutdown")
+		}
+		rcancel()
+	}
 	logger.Info("mitigation-controller shutting down")
 }
 
@@ -243,6 +255,12 @@ func loadConfig() (*runtimeConfig, error) {
 		}
 		scoreTrace = f
 	}
+	formula := loadFormulaConfig()
+	if formula != nil {
+		if err := formula.validate(); err != nil {
+			return nil, err
+		}
+	}
 	return &runtimeConfig{
 		nodeName:           nodeName,
 		targetsPath:        envStr("TARGETS_CONFIG", defaultTargetsPath),
@@ -254,7 +272,7 @@ func loadConfig() (*runtimeConfig, error) {
 		minCPU:             minQ,
 		maxCPU:             maxQ,
 		horizontalCooldown: time.Duration(cooldownSec) * time.Second,
-		formula:            loadFormulaConfig(),
+		formula:            formula,
 		scoreTrace:         scoreTrace,
 	}, nil
 }
