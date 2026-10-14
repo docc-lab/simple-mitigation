@@ -37,6 +37,10 @@ else
     sudo cat /etc/kubernetes/admin.conf > "$BUILD/kubeconfig-admin"
 fi
 chmod +x "$BUILD/run-mitigation.sh" "$BUILD/mitigation-controller"
+# mktemp -d is 0700 and tar applies "."'s mode to the kit dir; the
+# orchestrator reads the kit and its logs as the normal user.
+chmod 755 "$BUILD"
+chmod 600 "$BUILD/kubeconfig-admin"
 
 echo "[kit] installing to $NODE:$KIT"
 tar -C "$BUILD" -czf - . | ssh "$NODE" "sudo mkdir -p '$KIT' && sudo tar -C '$KIT' -xzf - && sudo chown -R root:root '$KIT'"
