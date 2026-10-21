@@ -1,5 +1,8 @@
 # Stage-3 controller kit
 
+Full cluster setup and run steps, from a fresh CloudLab experiment to the
+sweep with the `hc` arm: [RUNBOOK.md](RUNBOOK.md).
+
 What the phase orchestrator (`dsb_hd_counter/.../stage3-eval/run-phased-stage3.sh`)
 expects on the target node, by default in `/tmp/mitig` on node-4:
 
