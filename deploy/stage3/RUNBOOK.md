@@ -79,7 +79,7 @@ The map is the sm110p one moved onto socket 0's even ids:
 | CPUs | use | sm110p (old) |
 |---|---|---|
 | 0, 2 | housekeeping, IRQs | 0–1 |
-| 4, 6 | victim `search` (HC Primary; `GOMAXPROCS=2`, limit 2) | 2–4 (3 HTs at 2.4 GHz ≈ 2 full cores at 3.1) |
+| 4, 6 | victim `search` (HC Primary; `GOMAXPROCS=1`, limit 2: one P so it saturates at ~4.3k rps, before the gRPC transport does) | 2–4 (3 Ps on 3 HTs at 2.4 GHz) |
 | 8, 10, 12, 14 | HC Secondary (aggressors' dedicated cores when HC is on) | 5–8 |
 | 16, 18, 20, 22 | rest of the aggressor pool | 9–11 |
 | 24 | mitigation controller | 12 |
@@ -340,11 +340,13 @@ kubectl set env deployment/search CPU_SET=4,6
 kubectl rollout status deployment/search
 ssh node-4 'for p in $(pgrep -x search); do grep Cpus_allowed_list /proc/$p/status; done'   # 4,6
 ```
-Run (rates are the script's defaults; operating point 2400 rps):
+Run with levels past the victim's knee (~4.3k e2e with one P) so the curve
+bends with it; otherwise an overload is misattributed as extrinsic. Operating
+point 2400 rps. ~23 min:
 ```bash
 cd /local/dsb_hd_counter/hotelReservation/noisy-neighbors/stage3-eval/score-verify
 URL=http://$(kubectl get node node-4 -o jsonpath='{.status.addresses[?(@.type=="InternalIP")].address}'):$(kubectl get svc frontend -o jsonpath='{.spec.ports[0].nodePort}')
-./calibration_sweep.sh --target-node node-4 --url "$URL" 2>&1 | tee calibration-node4.log
+./calibration_sweep.sh --target-node node-4 --url "$URL" --rates "300 600 1200 2400 3000 3600 4200 4800 5600" 2>&1 | tee calibration-node4.log
 ```
 Review the level table it prints (arrival_mean scales with rate; ~1000
 windows per level; sigma in the tens of kcyc), then run the ConfigMap apply
@@ -468,6 +470,14 @@ settings), `config-as-run.yaml`, `node_freq_floors`, `armed_epoch_ns.txt`,
   every Go service, limits raised (frontend 16, other non-victim services
   8, search stays 3). Jaeger client-vs-server span gaps of tens of ms are
   the CFS-throttling signature.
+- The int configs never overloaded the victim (July included: p2 e_iso 0.08).
+  Two causes on the 8360Y: a 2- or 3-P victim at 3.1 GHz is too fast for the
+  chain, and the frontend->search gRPC connection caps at 100 concurrent
+  streams (grpc-go 1.56.3), so the chain tops out at 100/latency = 6-9k rps
+  with requests queueing outside the victim's handler (processing-time curve
+  flat to 7200 rps). Fix: `GOMAXPROCS=1` on search, knee ~4.3k, int extras
+  3600/4800 on a base of 800. Also: a memcached restart empties the cache and
+  `mongodb-reservation` saturates for minutes; warm up before measuring.
 - A non-victim HR pod (`rate`) scheduled onto node-4 unpinned and burned
   2.6 cores there in the baseline: keep the `dedicated=special` taint on
   node-4 (step 7).
