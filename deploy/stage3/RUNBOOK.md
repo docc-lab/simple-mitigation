@@ -348,7 +348,13 @@ bends with it; otherwise an overload is misattributed as extrinsic. Score
 handler goroutine runs, so run-queue waiting under self-overload is invisible
 to `processing_time` (measured flat to 5600 rps while e2e p50 went 5 -> 40 ms);
 `total_time` shows it. Downstream services sit on unloaded nodes, so their
-latency noise is small. Operating point 2400 rps. ~23 min:
+latency noise is small. Operating point 3600 rps (~75% of the single P's
+~4.8k capacity): at 2400 the victim was ~65% idle and, on 6.12's EEVDF with
+SMT off, CPU-bound neighbours only cost it a few ms of wake-up latency
+(+70% tail with the 6-core pool 1.5x oversubscribed); contention damage
+scales with the victim's utilization, so the ext configs drive it at 3600.
+Re-running only the calibrator on recorded levels is enough to move the
+operating point (`calibrate_from_stream.py --operating-rps 3600 ...`). ~23 min:
 ```bash
 cd /local/dsb_hd_counter/hotelReservation/noisy-neighbors/stage3-eval/score-verify
 URL=http://$(kubectl get node node-4 -o jsonpath='{.status.addresses[?(@.type=="InternalIP")].address}'):$(kubectl get svc frontend -o jsonpath='{.spec.ports[0].nodePort}')
@@ -485,6 +491,16 @@ settings), `config-as-run.yaml`, `node_freq_floors`, `armed_epoch_ns.txt`,
   flat to 7200 rps). Fix: `GOMAXPROCS=1` on search, knee ~4.3k, int extras
   3600/4800 on a base of 800. Also: a memcached restart empties the cache and
   `mongodb-reservation` saturates for minutes; warm up before measuring.
+- Controller substituted 1 for a genuine `ext_pct_90 = 0` (and the p50
+  prediction for `y50_current = 0`), inflating e_iso on every clamped window
+  (baseline ext90 ~0.9 with y90 = 0). Fixed in `pkg/features/compute.go`
+  (fallbacks only for producers without `source_kind=gordion`); July's e_iso
+  values carry this inflation. Re-run `install-kit.sh` after pulling, the kit
+  is not rebuilt by `go test`.
+- Weak ext contention despite a saturated pool: a victim at ~65% of one P is
+  barely hurt by CPU-bound neighbours on EEVDF with SMT off (wake-up latency
+  only). Run the victim near ~75% (operating point 3600) so time-sharing
+  turns into queueing; July's 3x tails came from SMT siblings on 5.15.
 - A non-victim HR pod (`rate`) scheduled onto node-4 unpinned and burned
   2.6 cores there in the baseline: keep the `dedicated=special` taint on
   node-4 (step 7).
