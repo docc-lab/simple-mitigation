@@ -340,13 +340,18 @@ kubectl set env deployment/search CPU_SET=4,6
 kubectl rollout status deployment/search
 ssh node-4 'for p in $(pgrep -x search); do grep Cpus_allowed_list /proc/$p/status; done'   # 4,6
 ```
-Run with levels past the victim's knee (~4.3k e2e with one P) so the curve
-bends with it; otherwise an overload is misattributed as extrinsic. Operating
-point 2400 rps. ~23 min:
+Run with levels past the victim's knee (~4.8k e2e with one P) so the curve
+bends with it; otherwise an overload is misattributed as extrinsic. Score
+`total_time`, not `processing_time`: the interceptor's timer starts when the
+handler goroutine runs, so run-queue waiting under self-overload is invisible
+to `processing_time` (measured flat to 5600 rps while e2e p50 went 5 -> 40 ms);
+`total_time` shows it. Downstream services sit on unloaded nodes, so their
+latency noise is small. Operating point 2400 rps. ~23 min:
 ```bash
 cd /local/dsb_hd_counter/hotelReservation/noisy-neighbors/stage3-eval/score-verify
 URL=http://$(kubectl get node node-4 -o jsonpath='{.status.addresses[?(@.type=="InternalIP")].address}'):$(kubectl get svc frontend -o jsonpath='{.spec.ports[0].nodePort}')
-./calibration_sweep.sh --target-node node-4 --url "$URL" --rates "300 600 1200 2400 3000 3600 4200 4800 5600" 2>&1 | tee calibration-node4.log
+./calibration_sweep.sh --target-node node-4 --url "$URL" --section total_time \
+    --rates "300 600 1200 2400 3000 3600 4200 4800 5600" 2>&1 | tee calibration-node4.log
 ```
 Review the level table it prints (arrival_mean scales with rate; ~1000
 windows per level; sigma in the tens of kcyc), then run the ConfigMap apply
