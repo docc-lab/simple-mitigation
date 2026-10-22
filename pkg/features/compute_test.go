@@ -34,6 +34,24 @@ func TestBuildSingleHorizonFallback(t *testing.T) {
 	}
 }
 
+func TestBuildDecompositionZeroIsNotAbsent(t *testing.T) {
+	// gordion emits y50_current / ext_pct_50 / ext_pct_90 on every event,
+	// and 0 is a real value there (clamp, or below baseline). It must not
+	// trigger the "old producer" fallbacks (y50 -> p50 channel, ext90 -> 1).
+	ev := &pb.ScoreEvent{SourceKind: "gordion", P50TrendPred: 0.4, TailTrendLabel: 0.9,
+		Y50Current: 0, ExtPct_50: 0, ExtPct_90: 0}
+	fv := Build(ev, nil, BuildConfig{HiThreshold: 0.5})
+	if fv.Y50Current != 0 || fv.ExtPct90 != 0 || fv.ExtPct50 != 0 {
+		t.Fatalf("gordion zeros must be kept, got y50=%v ext50=%v ext90=%v", fv.Y50Current, fv.ExtPct50, fv.ExtPct90)
+	}
+	// An older producer (no source_kind) keeps the fallbacks.
+	old := &pb.ScoreEvent{P50TrendPred: 0.4, TailTrendLabel: 0.9}
+	fv = Build(old, nil, BuildConfig{HiThreshold: 0.5})
+	if math.Abs(fv.Y50Current-0.4) > 1e-6 || fv.ExtPct90 != 1 {
+		t.Fatalf("old-producer fallbacks lost, got y50=%v ext90=%v", fv.Y50Current, fv.ExtPct90)
+	}
+}
+
 func TestBuildSpatialMonotoneRising(t *testing.T) {
 	ev := &pb.ScoreEvent{
 		P50TrendPred:  0.3,

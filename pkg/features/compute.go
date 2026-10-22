@@ -68,10 +68,19 @@ func Build(latest *pb.ScoreEvent, window []Sample, cfg BuildConfig) FeatureVecto
 		fv.TailNow = float64(latest.TailTrendLabel)
 		fv.ModelVer = latest.ModelVersion
 		fv.SourceKind = latest.SourceKind
-		// dsb fields 8-10; zero means "not emitted by this producer build":
-		// y50_current falls back to the p50 channel, ext_pct_90 to 1.
+		// dsb fields 8-10. Proto3 cannot distinguish "not emitted" from a
+		// genuine 0, so the fallbacks key on the producer: the gordion
+		// formula source always emits all three, and 0 is a common, real
+		// value there (y50_current=0 below baseline; ext_pct_90=0 whenever
+		// T~ <= D(lambda), i.e. the clamp). Treating that 0 as "absent"
+		// substituted the prediction channel for y50 and 1 for ext90, which
+		// inflated e_iso = y90*ext90 on every clamped window (seen as
+		// ext90~0.9 with y90=0 in baselines, and ext90 0.77 on a pure
+		// intrinsic overload). Older producers (no source_kind / onnx-only)
+		// keep the fallbacks: y50_current -> p50 channel, ext_pct_90 -> 1.
+		emitsDecomposition := latest.SourceKind == "gordion"
 		fv.Y50Current = float64(latest.Y50Current)
-		if fv.Y50Current == 0 {
+		if fv.Y50Current == 0 && !emitsDecomposition {
 			fv.Y50Current = fv.P50Now
 		}
 		// ExtPct50 keeps a raw zero: its consumer is the horizontal law's
@@ -84,7 +93,7 @@ func Build(latest *pb.ScoreEvent, window []Sample, cfg BuildConfig) FeatureVecto
 		// track y90, not vanish.)
 		fv.ExtPct50 = float64(latest.ExtPct50)
 		fv.ExtPct90 = float64(latest.ExtPct90)
-		if fv.ExtPct90 == 0 {
+		if fv.ExtPct90 == 0 && !emitsDecomposition {
 			fv.ExtPct90 = 1
 		}
 		fv.HasSpatial = len(latest.P50Horizons) > 0

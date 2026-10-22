@@ -81,22 +81,24 @@ The map is the sm110p one moved onto socket 0's even ids:
 | 0, 2 | housekeeping, IRQs | 0–1 |
 | 4, 6 | victim `search` (HC Primary; `GOMAXPROCS=1`, limit 2: one P so it saturates at ~4.3k rps, before the gRPC transport does) | 2–4 (3 Ps on 3 HTs at 2.4 GHz) |
 | 8, 10, 12, 14 | HC Secondary (aggressors' dedicated cores when HC is on) | 5–8 |
-| 16, 18, 20, 22 | rest of the aggressor pool | 9–11 |
+| 16, 18, 20, 22 | unused (were in the first, 10-core pool) | 9–11 |
 | 24 | mitigation controller | 12 |
 | 26 | HC Listener | 13 |
 | 28 | HC Balancer | 14 |
 | 30 | HC Monitor kthread | 15 |
 | everything else (62 cores incl. all of socket 1) | nothing (node-4 is tainted) | — |
 
-**Aggressor pool (decided 2026-10-21):** the orchestrator writes
-`cpuset.cpus = 4,6,8,10,12,14,16,18,20,22` (`AGGR_CPUSET` in
+**Aggressor pool (decided 2026-10-21, resized 2026-10-22):** the orchestrator
+writes `cpuset.cpus = 4,6,8,10,12,14` (`AGGR_CPUSET` in
 `run-phased-stage3.sh`) into every aggressor pod on node-4, re-applied every
-10 s with the `gordion-aggr` label. A 2-core victim on a 72-core node is
-otherwise never touched by unpinned neighbours (measured: e2e p99 unchanged,
-cycles/request +12% from the clock rising, nothing to mitigate). The 10-core
-pool recreates July's shared node: aggressors time-share the victim's cores,
-and pool minus victim = 8 = July's `CAP_BASE_CORES`. Set `AGGR_CPUSET=`
-(empty) to run unconfined.
+10 s with the `gordion-aggr` label; `aggr_affinity_p3.txt` in each run
+records that it took. A 2-core victim on a 72-core node is otherwise never
+touched by unpinned neighbours (measured: e2e p99 unchanged, nothing to
+mitigate). Sizing: the ext-severe aggressors burn ~9 cores on node-4 (two
+`catalogue` pods at ~4 each) and a 10-core pool cost the victim only +25%
+latency, so the pool is the victim's cores plus HC's Secondary cores, ~1.5x
+oversubscribed under severe load. `CAP_BASE_CORES` = pool = 6, `K_P` 14.
+Set `AGGR_CPUSET=` (empty) to run unconfined.
 
 The map appears in these places (already set for the 8360Y in git):
 
@@ -104,7 +106,7 @@ The map appears in these places (already set for the 8360Y in git):
 |---|---|
 | node-4 `/etc/default/hc-harvest` (written once by `setup-harvest.sh` with sm110p values — **fix by hand**, below) | `HC_CPULIST`, `HC_SECONDARY_CPULIST`, `HC_MONITOR_CPU`, `HC_BALANCER_CPU`, `HC_LISTENER_CPU` |
 | simple-mitigation-1 `deploy/stage3/arms/hc.env`, `hc-combined.env` | `HC_VICTIM_CPULIST`, `HC_SECONDARY_CPULIST`, `HC_BALANCER_CPU` |
-| simple-mitigation-1 `deploy/stage3/arms/common.env` | `CONTROLLER_CPU`; `CAP_BASE_CORES` 8 and `K_P` 18 (July's values; pool minus victim = 8 cores) |
+| simple-mitigation-1 `deploy/stage3/arms/common.env` | `CONTROLLER_CPU`; `CAP_BASE_CORES` 6 (= the pool) and `K_P` 14 (cap reaches 0 at e_iso 0.79 as in July) |
 | dsb_hd_counter `stage3-eval/run-phased-stage3.sh` | `AGGR_CPUSET` (the pool) |
 | dsb_hd_counter `kubernetes/search/search*-deployment.yaml` | `limits.cpu` 2, `GOMAXPROCS` 2 |
 | dsb_hd_counter `stage3-eval/configs/phased-*.yaml` (9 files) | `victim.cpu_set` |
@@ -376,8 +378,8 @@ For the int configs, `i_horz` should rise in p2/p3 while `e_iso` stays low.
 
 ## 10. Sweep: none / isolate / horizontal / combined
 
-`CAP_BASE_CORES` (8) and `K_P` (18) in `deploy/stage3/arms/common.env`
-are July's values and match the 10-core aggressor pool. If step 9 shows contention much weaker or
+`CAP_BASE_CORES` (6) and `K_P` (14) in `deploy/stage3/arms/common.env`
+match the 6-core aggressor pool (cap = pool, zero at e_iso 0.79 like July). If step 9 shows contention much weaker or
 stronger than July's (p2 e_iso ≈ 0.5 in its ext configs), revisit the pool or the configs' load levels before
 the sweep; after any change, commit, `git pull` on node-0, and re-run
 `install-kit.sh`.
