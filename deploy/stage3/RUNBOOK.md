@@ -354,7 +354,12 @@ SMT off, CPU-bound neighbours only cost it a few ms of wake-up latency
 (+70% tail with the 6-core pool 1.5x oversubscribed); contention damage
 scales with the victim's utilization, so the ext configs drive it at 3600.
 Re-running only the calibrator on recorded levels is enough to move the
-operating point (`calibrate_from_stream.py --operating-rps 3600 ...`). ~23 min:
+operating point (`calibrate_from_stream.py --operating-rps 3600 ...`). The
+tanh gain `k` must track sigma/baseline (y = tanh(k·dT/sigma)): July's
+k = 0.025 went with sigma90 = 4.3% of baseline p90 (y90 = 0.8 at a 2.9x
+tail); this calibration has 7%, so `calibration_sweep.sh` now defaults to
+k = 0.06 (at 0.025 a 2.7x tail scored only y90 = 0.35). The arm thresholds
+are unchanged. ~23 min:
 ```bash
 cd /local/dsb_hd_counter/hotelReservation/noisy-neighbors/stage3-eval/score-verify
 URL=http://$(kubectl get node node-4 -o jsonpath='{.status.addresses[?(@.type=="InternalIP")].address}'):$(kubectl get svc frontend -o jsonpath='{.spec.ports[0].nodePort}')
