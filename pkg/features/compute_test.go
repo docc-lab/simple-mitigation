@@ -39,7 +39,7 @@ func TestBuildDecompositionZeroIsNotAbsent(t *testing.T) {
 	// and 0 is a real value there (clamp, or below baseline). It must not
 	// trigger the "old producer" fallbacks (y50 -> p50 channel, ext90 -> 1).
 	ev := &pb.ScoreEvent{SourceKind: "gordion", P50TrendPred: 0.4, TailTrendLabel: 0.9,
-		Y50Current: 0, ExtPct_50: 0, ExtPct_90: 0}
+		Y50Current: 0, ExtPct50: 0, ExtPct90: 0}
 	fv := Build(ev, nil, BuildConfig{HiThreshold: 0.5})
 	if fv.Y50Current != 0 || fv.ExtPct90 != 0 || fv.ExtPct50 != 0 {
 		t.Fatalf("gordion zeros must be kept, got y50=%v ext50=%v ext90=%v", fv.Y50Current, fv.ExtPct50, fv.ExtPct90)
