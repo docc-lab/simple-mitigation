@@ -464,7 +464,65 @@ Each run's `mitigation/` has `arm.txt`, `<name>.env.txt` (exact controller
 settings), `config-as-run.yaml`, `node_freq_floors`, `armed_epoch_ns.txt`,
 `<name>.ctrl.log` and `<name>.scores.csv`.
 
+## 13. Predictor training data from the stage-3 testbed (SMT ON, arm none)
+
+Done 2026-10-23 on the Clemson cluster. The GRU predictor
+(dsb_hd_counter `origin/master`
+`hotelReservation/noisy-neighbors/ml_training_deployment/gru_train.py`) trains
+on the victim's windowed `run_data.json` (73 features per 100 ms window) with
+labels computed offline from `processing_time` by
+`contention_scoring/act_func_label2.py`. Stage-3 run dirs already contain
+that file; three things had to change:
+
+- the victim must sample the trainer's 10 perf events (LLC-loads,
+  LLC-load-misses, dTLB-loads were missing from the sampler default) —
+  `stage3-eval.sh` now sets `PERF_EVENTS` (override `STAGE3_PERF_EVENTS`);
+- the capture must wait for the sampler's 30 s flush (every sweep file lost
+  its last ~20 s) — `capture_victim_run_data` now re-reads until the last
+  sample passes `ended_epoch_ns`;
+- **`processing_time` only reacts to SMT siblings.** Measured p2/p1 on
+  ext-steady-severe with arm none: pool 4,6,8-14 → processing p50 1.03× /
+  p90 1.18× (total_time 3×); pool 4,6 (5× oversubscribed) → 1.03× / 1.23×
+  (total 20×); SMT on, aggressors on the siblings 76,78 → **1.64× / 1.53×**.
+  A 50 µs handler is almost never preempted mid-execution, so time-sharing
+  lands entirely in run-queue wait (total_time). July's signal came from
+  hyperthreads on 5.15; `nosmt=force` (an HC requirement) removed it.
+
+Boot node-4 with SMT on for collection (and back to `nosmt=force` for any
+HC arm):
+```bash
+ssh node-4 'sudo sed -i "s/ nosmt=force//" /etc/default/grub.d/99-harvest.cfg && sudo update-grub && sudo reboot'
+until ssh -o ConnectTimeout=5 node-4 true 2>/dev/null; do sleep 10; done
+# the CloudLab image re-enables the swap partition on reboot and kubelet refuses to start:
+ssh node-4 'sudo swapoff -a && sudo sed -i "/swap/s/^/#/" /etc/fstab && sudo systemctl restart kubelet'
+kubectl get nodes node-4 -w                    # Ready within a minute
+ssh node-4 'cat /sys/devices/system/cpu/smt/active; cat /sys/devices/system/cpu/cpu4/topology/thread_siblings_list'   # 1; 4,76
+./deploy/stage3/install-kit.sh node-4 /tmp/mitig   # /tmp is cleared by the reboot
+```
+To restore SMT off: `sudo sed -i 's/max_cstate=0"$/max_cstate=0 nosmt=force"/' /etc/default/grub.d/99-harvest.cfg`, `update-grub`, reboot, same swap check, re-install the kit.
+
+Collection sweep (node-0, tmux, agent-forwarded):
+```bash
+cd /local/dsb_hd_counter/hotelReservation/noisy-neighbors/stage3-eval
+python3 tools/gen_collect_configs.py            # 25 points -> configs/collect/, plan.txt
+mkdir -p data/collect-smt
+DEADLINE="HH:MM" ./run-collect.sh 2>&1 | tee -a data/collect-smt/console.log   # ~5.5 min/point, resumable
+python3 tools/run_data_phases.py data/collect-smt/*                            # p1 vs p2 per point
+tar -czf /tmp/collect-smt.tgz data/collect-smt data/probe-*
+```
+Points: baselines at 1500/2500/3200/4000 (labeler baseline stats), ext
+light/mid/heavy × steady/bursty/exp, SN-only, SS-only, replicas 3, three
+points with pool `4,6,76,78`, int extras 2000/3000/4200 and a bursty victim,
+two mixed. None reuse the nine eval configs' load points. Converting the run
+dirs into the trainer's `run_data_iterN.json` layout:
+`tools/stage3_to_training.py` (slices by the epoch files, adds
+`offset_from_workload_ms`, drops zero-request windows).
+
 ## Known pitfalls (all hit on the first two clusters)
+
+- node-4 `NotReady` after a reboot, kubelet log `running with swap on is not
+  supported`: the image re-enables `/dev/sda99` swap. `swapoff -a`, comment
+  the fstab line, restart kubelet (section 13).
 
 - wrk2 output is just `unable to connect to <node-4>:<nodePort> Connection
   refused` and 0 score events: the frontend was restarted (Consul recovery)
