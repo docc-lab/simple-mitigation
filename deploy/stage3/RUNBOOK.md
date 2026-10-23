@@ -348,7 +348,11 @@ bends with it; otherwise an overload is misattributed as extrinsic. Score
 handler goroutine runs, so run-queue waiting under self-overload is invisible
 to `processing_time` (measured flat to 5600 rps while e2e p50 went 5 -> 40 ms);
 `total_time` shows it. Downstream services sit on unloaded nodes, so their
-latency noise is small. Operating point 3600 rps (~75% of the single P's
+latency noise is small. **Provisional:** `processing_time` is the metric the
+design and July's results are built on; `total_time` is a workaround until the
+contention setup is changed so that `processing_time` reacts (contention that
+inflates the handler's own execution, not run-queue waiting of a mostly idle
+thread). Treat total_time sweeps accordingly. Operating point 3600 rps (~75% of the single P's
 ~4.8k capacity): at 2400 the victim was ~65% idle and, on 6.12's EEVDF with
 SMT off, CPU-bound neighbours only cost it a few ms of wake-up latency
 (+70% tail with the 6-core pool 1.5x oversubscribed); contention damage
@@ -506,6 +510,10 @@ settings), `config-as-run.yaml`, `node_freq_floors`, `armed_epoch_ns.txt`,
   barely hurt by CPU-bound neighbours on EEVDF with SMT off (wake-up latency
   only). Run the victim near ~75% (operating point 3600) so time-sharing
   turns into queueing; July's 3x tails came from SMT siblings on 5.15.
+- `search-overflow` replicas crash-loop (`Failed to open perf event cycles on
+  CPU -1`): an empty `CPU_SET` makes the windowed sampler open counters on no
+  CPU. The overflow manifest now pins to `0-3`; a horizontal arm whose
+  `pod_placement_p3.txt` shows overflow pods in Error/CrashLoopBackOff is void.
 - A non-victim HR pod (`rate`) scheduled onto node-4 unpinned and burned
   2.6 cores there in the baseline: keep the `dedicated=special` taint on
   node-4 (step 7).
