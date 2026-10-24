@@ -95,17 +95,27 @@ def load_run(d):
     sc = {k: np.array(v) for k, v in sc.items()}
 
     acts = []
+    # Actual overflow replicas: the controller's n counter (scores.csv) runs
+    # ahead of the deployment (the horizontal actuator has a 30 s per-
+    # deployment cooldown and refuses the intermediate steps), so take the
+    # applied scale actions' after.replicas instead.
+    reps = [(0.0, 0)]
     for f in glob.glob(os.path.join(mdir, '*.ctrl.log')):
         for line in open(f, errors='replace'):
-            if '"formula: h' not in line:
+            if '"formula: h' not in line and '"reason":"scaled"' not in line:
                 continue
             try:
                 e = json.loads(line)
             except ValueError:
                 continue
-            acts.append((ts_epoch(e['time']) - t0, e.get('msg', '').replace('formula: ', ''), e))
+            t = ts_epoch(e['time']) - t0
+            if e.get('msg') == 'action' and e.get('kind') == 'horizontal' and e.get('applied'):
+                reps.append((t, int((e.get('after') or {}).get('replicas', 0))))
+                continue
+            acts.append((t, e.get('msg', '').replace('formula: ', ''), e))
     acts.sort(key=lambda a: a[0])
-    return dict(lat=lat, sc=sc, acts=acts, arm_t=arm_t, t0=t0)
+    reps.sort()
+    return dict(lat=lat, sc=sc, acts=acts, reps=reps, arm_t=arm_t, t0=t0)
 
 
 def main():
@@ -194,9 +204,9 @@ def main():
             if c == len(runs) - 1:
                 ax2.set_ylabel('HC state', fontsize=9)
         elif key.startswith('horizontal'):
-            if len(sc['t']):
-                st, nv = tick_mean(sc['t'], sc['n'])
-                ax2.step(st, nv, where='post', lw=1.4, c=PALETTE[1], alpha=0.9, label='overflow replicas n')
+            rt = [t for t, _ in R['reps']] + [args.duration]
+            rv = [n for _, n in R['reps']] + [R['reps'][-1][1]]
+            ax2.step(rt, rv, where='post', lw=1.4, c=PALETTE[1], alpha=0.9, label='overflow replicas (actual)')
             ax2.set_yticks([0, 1, 2, 3])
             if c == len(runs) - 1:
                 ax2.set_ylabel('overflow replicas', fontsize=9)

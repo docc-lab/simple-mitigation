@@ -577,3 +577,131 @@ dirs into the trainer's `run_data_iterN.json` layout:
   node-4 (step 7).
 - Results in `data/stage3eval_*` from earlier runs get swept into the next
   arm's directory by the loop's `mv`; move them out first.
+
+## 14. processing_time scoring (SMT ON) and the motivation experiment (2026-10-23/24)
+
+Section 9 scored `total_time` because `processing_time` did not react with
+SMT off. With node-4 booted SMT ON (section 13) the aggressor pool moves onto
+the victim's **sibling threads** and `processing_time` becomes the score input
+again, as in the design and in July. Everything below was done on the cluster
+and is in git (dsb_hd_counter `stage3-predictor`, simple-mitigation-1 `main`).
+
+**Setup changes**
+
+| where | change |
+|---|---|
+| `run-phased-stage3.sh` | default `AGGR_CPUSET=8,10,12,14,76,78` (76,78 = siblings of the victim's 4,6; was `4,6,8,10,12,14`, which only inflated total_time). `confine_aggressors` skips pods annotated `mitigation/hc-cpuset-set-by-node` (held by hc). |
+| `score-verify/` | processing_time calibration, SMT on, victim alone on 4,6: `calibration_sweep.sh --section processing_time --rates "300 600 1200 2400 3000 3600 4200 4800 5600"`, then `calibrate_from_stream.py ... --window 10 --k K` (see below). Kept as `gordion-node4-8360y-smt-proc-3600.json` / `curve-node4-8360y-smt-proc-3600.csv`; the total_time ones are `calibration/total_time-20261022/`. |
+| `pkg/actuators/hc/hc.go` | `confine` also widens the **pod-level** cpuset (v2 effective cpus are the intersection down the tree; with the pool excluding 4,6 the Balancer could never lend them). `Restore` writes parents first and, for a container that inherited its cpuset (saved value ""), writes the parent's `cpuset.cpus.effective`: cgroup v2 refuses to empty a populated cgroup's `cpuset.cpus` (ENOSPC), which every first Restore of the October sweep hit and silently left that container confined. |
+| `cmd/mitigation-controller/formula.go` | `HC_THETA_OFF == HC_THETA_ON` accepted (bang-bang). |
+| `deploy/stage3/arms/hc-bang.env` | hc, `HC_UP_WINDOWS=1`, single threshold, `HC_DOWN_WINDOWS=50` (release 5 s after the score drops; HC removes the contention that triggered it, so a zero-delay release would limit-cycle at the tick). |
+| `deploy/stage3/arms/horizontal-any.env` | scale-out on y50 without the intrinsic weighting (`HORZ_FROM_EXT=0`, `HORZ_UP_WINDOWS=1`): replication applied to extrinsic contention = the unmatched mitigation. |
+| `configs/motiv-ext-bursty.yaml` | victim 3600 exp; SN/SS `{burst_s 10, idle_s 10, peak 7000/8000, base 500/600}` from t=20 → bursts 20-30, 40-50, 60-70 (p2) and 80-90, 100-110, 120-130 (p3). |
+| `tools/motiv_phases.py` | per-phase and per-burst processing/total p50/p90, e_iso/y50 per phase, controller actions with offsets from t0. |
+
+**Why `k` and `smooth_window` changed.** y = tanh(k·ΔT/σ). Under SMT-sibling
+contention processing p90 rises ~1.5× (p50 ~1.65×), far less than
+total_time's 3-6×, and the intrinsic curve D(λ) is flat, so
+ext90 = 1 − D/T̃ ≈ 0.33 at 1.5×: **e_iso saturates near 0.27**, not July's
+~0.5. k is set so a 1.5× tail scores y90 = 0.8
+(k = atanh(0.8)·σ90/(0.5·p90)); the smoother is 10 windows (1 s) instead of
+30 so the bang-bang arm sees a burst within ~0.3 s instead of ~1 s. Both are
+in `gordion.json`; thresholds below were read off the ARM=none run.
+
+**Calibration (processing_time, SMT on, 2026-10-23 23:03-23:25):** baseline at
+3600 rps p50 108 kcyc / p90 188 kcyc at 2.8 GHz (38.7 / 67 us), sigma50 13.6 %,
+sigma90 5.9 % of the baseline (window 10); k = 0.1304. The curve is flat
+(d50 82-119 kcyc over 180-3000 rps arrival), so any inflation reads as
+extrinsic.
+
+**Threshold.** ARM=none on `motiv-ext-bursty`: e_iso idle troughs 0.03-0.08,
+burst plateaus 0.30-0.44, first burst bin 0.16, p1 ~0 (one 0.5 spike in the
+first second after t0: smoother warm-up). `HC_THETA_ON = HC_THETA_OFF = 0.15`,
+`THETA_ON = 0.15` for horizontal-any. `hc-balancer` static unit must be
+inactive and `hc-listener` active (`systemctl start hc-listener`).
+
+**Result (`data/motiv/{none,hc-bang,horizontal-any}`, `tools/motiv_phases.py --actions data/motiv/*`):**
+
+| arm | p2 bursts proc p90 | p3 bursts proc p90 | p2 bursts total p50/p90 | p3 bursts total p50/p90 | p3 e_iso | actions |
+|---|---|---|---|---|---|---|
+| none | 1.75x | 1.83x | 2.93x / 2.65x | 3.13x / 2.64x | 0.29 | - |
+| hc-bang | 1.74x | **1.18x** | 3.02x / 2.42x | **1.13x / 1.11x** | **0.02** | apply 1.7 s after ARM; 6 apply/restore cycles (~6 s on, ~4 s off: the limit cycle), 0 restore errors |
+| horizontal-any, replicas OFF node-4 (old manifest; invalid as a replication test) | 1.77x | 1.99x | 2.95x / 2.74x | 0.82x / 0.85x | 0.32 | 1 uncontended replica at ARM+1 s, 2 at +33 s, back to 1 at +63 s |
+| horizontal-any, replicas ON node-4 pinned 4,6 (`data/motiv/horizontal-any-node4`) | 1.63x | **2.09x** | 2.19x / 1.92x | 0.82x / 0.79x | **0.38** | 1 replica at ARM+1 s, 2 at +33 s (actuator's 30 s per-deployment cooldown; the controller's n counter ran to 3) |
+
+(x = relative to that run's p1; proc = victim handler execution, total = victim
+service total incl. downstream; whole-run wrk2 e2e p50: none 43 ms, hc-bang
+31 ms, horizontal-any 23 ms.)
+
+Reading: with the replicas on the contended node the handler gets *slower*
+(p90 2.09x vs 1.63x unmitigated) and the score rises (e_iso 0.38 vs 0.28):
+replication adds a second contended instance on the same cores. Its lower
+total latency is queueing relief from splitting the traffic, bought with
+extra capacity, not mitigation. Harvesting removes the contention (processing p90 back to 1.18x,
+score to ~0, total back to ~1.1x) within ~2 s of each burst. Replication
+lowers the *end-to-end* latency because three overflow replicas on idle
+nodes take 3/4 of the traffic, but the victim's own execution gets slower
+(proc p90 1.99x) and the score stays where it was (e_iso 0.32): the
+contention is untouched, the symptom is bought with 4x the capacity. The
+bang-bang limit cycle (HC removes the signal it was triggered by, so it
+releases 5 s later and re-applies ~4 s after that) is visible in the action
+list; `HC_DOWN_WINDOWS` (hc-bang.env) is the knob if a longer hold is wanted.
+
+**Pitfalls seen here.** (1) After a horizontal run `search-overflow` was left
+at 1 replica (controller shutdown Restore refused with "cross-node"); check
+`kubectl get deploy search-overflow` and scale to 0 before the next run.
+(2) `install-kit.sh` and the orchestrator read stdin: when driving them from a
+script fed through `bash -s`, add `</dev/null` or they eat the script.
+(3) The deployed `gordion-search` ConfigMap is now the processing_time one;
+the total_time one is `score-verify/calibration/total_time-20261022/`.
+
+**Figure.** `simulation/plot_motiv.py --root <dir with none/ hc-bang/ horizontal-any/> --theta 0.15`
+(derived from `plot_real_run.py`'s loaders) writes
+`simulation/results/motiv_ext_bursty_timeseries.{png,pdf}`: per arm, handler
+execution (processing p50/p90), victim service latency (total p50/p90) and
+e_iso with the actuator state (HC held / overflow replicas), bursts shaded.
+The hc-bang column shows the limit cycle directly: processing p90 snaps back
+to baseline while HC is held and spikes in the ~4 s release gaps.
+
+**Predictor data after the pool change (2026-10-24).** The 25-point
+collection (section 13, `data/collect-smt`) used the sibling threads alone
+as the pool (22 points) or `4,6,76,78` (3 points). Only the ext/mixed points
+depend on the pool; baselines and int configs put nothing on node-4. The 12
+ext + 2 mixed points were re-collected with the eval pool
+(`configs/collect/plan-evalpool.txt`, `OUT=collect-smt-evalpool`), ~80 min.
+Dataset A = the 10 pool-independent points of `collect-smt` + the 14 of
+`collect-smt-evalpool`; the old ext points stay as dataset B (stronger,
+siblings-only contention) for augmentation only. Label caveat: the offline
+labeller scores processing **p50**, which in the eval pool barely moves
+(1.05x in bursts) while p90 moves 1.75x and the hc trigger is p90-based
+(e_iso = y90·ext90). Decide the label percentile before training; both can be
+derived from the same run_data.
+
+**Replication placement (design change 2026-10-24).** `kubernetes/search/
+search-overflow-deployment.yaml` now schedules the overflow replicas ON
+node-4, pinned to the victim's cores (`CPU_SET 4,6`, siblings = aggressor
+pool), with the taint toleration. The first horizontal-any run above used the
+old manifest (replicas off node-4), which is why its e2e latency dropped:
+every replica was uncontended. Replication adds capacity where the service
+is; only migration moves it away from the contention. Re-apply the manifest
+after pulling (`kubectl apply -f .../search-overflow-deployment.yaml`); the
+pending horizontal re-run of the 9 phased configs uses it too. The same-node
+run is `data/motiv/horizontal-any-node4`
+(`plot_motiv.py --dirs horizontal-any=horizontal-any-node4`).
+
+**Commit (from the laptop; the changed files were copied into the local
+clones, node-0 holds the same edits uncommitted -- after pushing, run
+`git checkout -- . && git clean -fd deploy/stage3/arms` in /local/simple-mitigation-1 and
+`git checkout -- hotelReservation/noisy-neighbors/stage3-eval && git pull` in /local/dsb_hd_counter,
+keeping score-verify's untracked captures if wanted):**
+```bash
+cd C:/coding-workspace/simple-mitigation-1
+git add cmd/mitigation-controller/formula.go pkg/actuators/hc/hc.go deploy/stage3/arms/hc-bang.env deploy/stage3/arms/horizontal-any.env     deploy/stage3/RUNBOOK.md simulation/plot_motiv.py
+git add -f simulation/results/motiv_ext_bursty_timeseries.png simulation/results/motiv_ext_bursty_timeseries.pdf   # results/ is gitignored
+git commit -m "hc: pod-level cpuset + ENOSPC-safe restore; bang-bang hc arm; HORZ_SIGNAL=e_iso arm; motivation figure; runbook sec 14"
+git push
+cd C:/coding-workspace/dsb_hd_counter-s3
+git add hotelReservation/noisy-neighbors/stage3-eval/run-phased-stage3.sh hotelReservation/noisy-neighbors/stage3-eval/configs/motiv-ext-bursty.yaml     hotelReservation/noisy-neighbors/stage3-eval/configs/collect/plan-evalpool.txt hotelReservation/noisy-neighbors/stage3-eval/tools/motiv_phases.py     hotelReservation/noisy-neighbors/stage3-eval/score-verify/gordion.json hotelReservation/noisy-neighbors/stage3-eval/score-verify/curve.csv     hotelReservation/noisy-neighbors/stage3-eval/score-verify/gordion-node4-8360y-smt-proc-3600.json hotelReservation/noisy-neighbors/stage3-eval/score-verify/curve-node4-8360y-smt-proc-3600.csv     hotelReservation/noisy-neighbors/stage3-eval/score-verify/calibration-node4-proc.log hotelReservation/noisy-neighbors/stage3-eval/score-verify/calibration/total_time-20261022/
+git commit -m "stage3: SMT-sibling aggressor pool, processing_time calibration (SMT on), motivation config, eval-pool collection plan, phase tool; overflow replicas on the target node"
+git push
+```
