@@ -459,7 +459,14 @@ func (a *Actuator) restoreLocked(ctx context.Context, listenerAddr string) error
 		for dir := range originals {
 			dirs = append(dirs, dir)
 		}
-		sort.Strings(dirs)
+		// Parents (pod level) before children: a child restored first would
+		// take its effective set from the still-narrowed parent.
+		sort.Slice(dirs, func(i, j int) bool {
+			if len(dirs[i]) != len(dirs[j]) {
+				return len(dirs[i]) < len(dirs[j])
+			}
+			return dirs[i] < dirs[j]
+		})
 		for _, dir := range dirs {
 			tids, err := a.resolver.ReadThreads(dir)
 			if err != nil {
@@ -476,7 +483,17 @@ func (a *Actuator) restoreLocked(ctx context.Context, listenerAddr string) error
 			if _, err := os.Stat(dir); err != nil {
 				continue
 			}
-			if err := a.resolver.WriteCpusetCpus(dir, originals[dir]); err != nil {
+			want := originals[dir]
+			if strings.TrimSpace(want) == "" {
+				// cgroup v2 refuses to empty cpuset.cpus of a populated cgroup
+				// (ENOSPC: "no space left on device"), which is what every
+				// Restore of a container that inherited its cpuset used to hit.
+				// "Inherit" explicitly with the parent's effective set instead.
+				if eff, err := os.ReadFile(filepath.Join(filepath.Dir(dir), "cpuset.cpus.effective")); err == nil {
+					want = strings.TrimSpace(string(eff))
+				}
+			}
+			if err := a.resolver.WriteCpusetCpus(dir, want); err != nil {
 				keep(fmt.Errorf("hc.Restore: pod %s: %w", pod.Name, err))
 			}
 		}
@@ -537,6 +554,15 @@ func (a *Actuator) confine(ctx context.Context, pod *corev1.Pod, cpus []int) err
 	if err != nil {
 		return err
 	}
+	// The pod-level cgroup too (2026-10-23): the stage-3 orchestrator pins the
+	// aggressor pod's cpuset.cpus to a pool that excludes the victim's cores,
+	// and cgroup v2 effective cpus are the intersection down the tree, so
+	// writing only the container level would leave the Balancer unable to
+	// lend an idle victim core (sched_setaffinity is clipped to the cpuset).
+	// Parents come first so the children's effective sets widen with them.
+	// The orchestrator skips pods carrying AnnHCCpusetSetByNode, and Restore
+	// writes the saved pod-level value (the pool) back.
+	dirs = withPodDirs(dirs)
 	originals := map[string]string{}
 	for _, dir := range dirs {
 		orig, err := a.resolver.ReadCpusetCpus(dir)
@@ -559,6 +585,26 @@ func (a *Actuator) confine(ctx context.Context, pod *corev1.Pod, cpus []int) err
 		}
 	}
 	return nil
+}
+
+// withPodDirs adds each container cgroup's parent (the pod cgroup) when it
+// has a cpuset.cpus of its own, parents before children, duplicates dropped.
+func withPodDirs(dirs []string) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, d := range dirs {
+		parent := filepath.Dir(d)
+		if _, err := os.Stat(filepath.Join(parent, "cpuset.cpus")); err == nil && !seen[parent] {
+			seen[parent] = true
+			out = append(out, parent)
+		}
+		if !seen[d] {
+			seen[d] = true
+			out = append(out, d)
+		}
+	}
+	sort.SliceStable(out, func(i, j int) bool { return len(out[i]) < len(out[j]) })
+	return out
 }
 
 // victimCPUs is the union of Cpus_allowed_list over every task in the victim

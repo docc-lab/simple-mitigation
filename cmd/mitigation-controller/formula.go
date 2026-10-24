@@ -82,6 +82,12 @@ type formulaConfig struct {
 	horzFromExt  bool
 	horzThetaOn  float64
 	horzThetaOff float64
+	// horzSignal (HORZ_SIGNAL) replaces Eq.(1)'s input: "" = y50/ŷ50 (the
+	// design); "e_iso" = the extrinsic tail magnitude y90·ext90 that drives
+	// hc/isolate, so scale-out fires on exactly the trigger the matched
+	// actuator would -- the "unmatched mitigation" arm of the 2026-10
+	// motivation experiment (deploy/stage3/arms/horizontal-any.env).
+	horzSignal string
 	// horizontalDeployment redirects Eq.(1)'s scale target (and syncN) to a
 	// separate deployment — the "overflow" pattern: the victim deployment
 	// stays hard-pinned to the target node at replicas=1, while n(t) scales
@@ -157,6 +163,7 @@ func loadFormulaConfig() *formulaConfig {
 		horzFromExt:          os.Getenv("HORZ_FROM_EXT") == "1",
 		horzThetaOn:          envFloat("HORZ_THETA_ON", thetaOn),
 		horzThetaOff:         envFloat("HORZ_THETA_OFF", thetaOff),
+		horzSignal:           os.Getenv("HORZ_SIGNAL"),
 		horizontalDeployment: os.Getenv("HORIZONTAL_DEPLOYMENT"),
 		horzUpWindows:        envInt("HORZ_UP_WINDOWS", 3),
 		horzDownWindows:      envInt("HORZ_DOWN_WINDOWS", 30),
@@ -208,14 +215,19 @@ func loadFormulaConfig() *formulaConfig {
 // validate rejects settings the tick loop cannot act on, so a typo fails at
 // startup instead of silently running the wrong arm.
 func (f *formulaConfig) validate() error {
+	switch f.horzSignal {
+	case "", "e_iso":
+	default:
+		return fmt.Errorf("HORZ_SIGNAL=%q: want empty (y50) or e_iso", f.horzSignal)
+	}
 	switch f.isoActuator {
 	case "isolate", "none":
 	case "hc":
 		if f.hc.params["secondary_cpulist"] == "" {
 			return fmt.Errorf("ISO_ACTUATOR=hc requires HC_SECONDARY_CPULIST")
 		}
-		if f.hc.thetaOff >= f.hc.thetaOn {
-			return fmt.Errorf("HC_THETA_OFF (%g) must be < HC_THETA_ON (%g)", f.hc.thetaOff, f.hc.thetaOn)
+		if f.hc.thetaOff > f.hc.thetaOn {
+			return fmt.Errorf("HC_THETA_OFF (%g) must be <= HC_THETA_ON (%g)", f.hc.thetaOff, f.hc.thetaOn)
 		}
 	default:
 		return fmt.Errorf("ISO_ACTUATOR=%q: want isolate, hc or none", f.isoActuator)
@@ -233,6 +245,7 @@ func (f *formulaConfig) logAttrs() []any {
 		"yhat_from_current", f.yhatFromCurrent,
 		"horz_from_ext", f.horzFromExt,
 		"horz_theta_on", f.horzThetaOn, "horz_theta_off", f.horzThetaOff,
+		"horz_signal", f.horzSignal,
 		"horizontal_deployment", f.horizontalDeployment,
 		"horz_up_windows", f.horzUpWindows, "horz_down_windows", f.horzDownWindows,
 		"iso_actuator", f.isoActuator,
@@ -363,6 +376,14 @@ func (c *controller) formulaTick(ctx context.Context, jobs []tickJob) {
 	// pressure, so gate it on the intrinsic share of the displacement.
 	// upSig anticipates (prediction channel), downSig confirms (current).
 	upSig, downSig := yhat, ynow
+	if f.horzSignal == "e_iso" {
+		var e float64
+		for _, j := range jobs {
+			e += j.fv.TailNow * j.fv.ExtPct90
+		}
+		e /= float64(len(jobs))
+		upSig, downSig = e, e
+	}
 	hOn, hOff := f.thetaOn, f.thetaOff
 	if f.horzFromExt {
 		upSig = yhat * (1 - ext50)
