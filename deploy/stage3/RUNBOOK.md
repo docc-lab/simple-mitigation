@@ -705,3 +705,64 @@ git add hotelReservation/noisy-neighbors/stage3-eval/run-phased-stage3.sh hotelR
 git commit -m "stage3: SMT-sibling aggressor pool, processing_time calibration (SMT on), motivation config, eval-pool collection plan, phase tool; overflow replicas on the target node"
 git push
 ```
+
+## 15. Motivation pass 2 on the Wisconsin sm110p: cores needed for the same SLO (2026-11-01)
+
+Third cluster (user instantiated it 2026-10-31 from `harvest-k612`; 5x sm110p,
+one 16C/32T Xeon Silver 4314 per node, sibling of CPU N is N+16). Restructured
+motivation experiment: (1) replication in three placements -- same node and
+same cores as the victim, same node on other cores, other node; (2) compare
+the arms by the cores they need to meet the same SLO and by the CPU time the
+victim, every replica and the aggressors actually consume; (3) later, more
+scenarios with their matched and unmatched mitigation.
+
+**Bring-up deltas against steps 1-7** (everything else as written):
+
+- node-4 must run **SMT ON** (processing_time only reacts to siblings, sec 13):
+  the profile boots it with `nosmt=force`; drop it from
+  `/etc/default/grub.d/99-harvest.cfg`, `update-grub`, reboot, then the swap /
+  kubelet chores of sec 13. `/sys/devices/system/cpu/smt/active` = 1, 32 CPUs.
+- Frequency: `intel_cpufreq` passive; **pinned at 2.4 GHz as in July**
+  (`intel_pstate/no_turbo=1`, `scaling_min_freq = scaling_max_freq = 2400000`
+  on every CPU of node-4; re-apply after a reboot).
+- CPU map (sm110p, SMT ON) = **July's layout** (user, 2026-11-01: this is the
+  July hardware, so use the July setup, not the R650 adaptations such as the
+  6-thread aggressor pool or the 1-P victim):
+
+  | CPUs | use |
+  |---|---|
+  | 18, 19, 20 | victim `search` (`GOMAXPROCS=3`, limit 3; data-collector's slot 6) |
+  | 2, 3, 4 | the victim's SMT siblings = where the handler contention comes from |
+  | 0-13, 16-29 | aggressor pool `AGGR_CPUSET=0-13,16-29` (whole node minus the daemons' cores: July-like unpinned) |
+  | 21-29 | "other threads" replication placement (nine threads for up to three 3-P replicas) |
+  | 14 / 15 (30, 31 idle) | HC Balancer / Monitor |
+  | 0 / 1 | HC Listener / controller (`CONTROLLER_CPU=1`), shared with the pool |
+  | HC Secondary | pool minus victim threads and siblings: `0,1,5-13,16,17,21-29` |
+
+  `/etc/default/hc-harvest`: `HC_CPULIST=18,19,20 HC_SECONDARY_CPULIST=0,1,5,...,29
+  HC_MONITOR_CPU=15 HC_BALANCER_CPU=14 HC_LISTENER_CPU=0`. The module reads
+  its cpulist at insmod: after editing, `systemctl stop hc-listener; rmmod
+  qidlecpu; systemctl start hc-listener` and check `/proc/idlecpu/cpulist`.
+- Pitfalls hit: files edited on Windows arrive with CRLF and the sourced
+  `arms/*.env` die with `$'\r': command not found` (strip with
+  `sed -i 's/\r$//'` before scp); `ssh node-0 'bash -s' < script` stops at the
+  script's first inner `ssh` (it eats stdin) -- scp the script and run it from
+  a file; a `pkill -f` pattern that also appears literally in the launching
+  command line kills the launching shell (the cpu-sampler start is two ssh
+  calls for that reason).
+
+**New pieces (in git after this pass):**
+
+| where | what |
+|---|---|
+| `deploy/stage3/cpu-sampler.sh` (kit) | per second: per-CPU busy/total jiffies and every pod cgroup's `cpu.stat usage_usec`; started/stopped by the orchestrator, lands in `mitigation/cpu_usage.csv` |
+| `deploy/stage3/arms/rep{1,2,3}.env` | replication with a fixed budget: horizontal-any trigger, `N_MAX=k`, `HORIZONTAL_COOLDOWN_SEC=2`, no scale-in during the run |
+| dsb `stage3-eval/run-phased-stage3.sh` | cpu-sampler start/stop/fetch, `pod_uids_{p3,end}.txt` (uid -> pod, to join the sampler's rows) |
+| dsb `stage3-eval/stage3-eval.sh` | also captures `run_data-overflow-<pod>.json` from every overflow replica |
+| dsb `stage3-eval/motiv2/overflow-{samecores,othercores,othernode}.yaml` | the three replica placements; `run-motiv2.sh` copies one over `kubernetes/search/search-overflow-deployment.yaml` before each run (hr_deploy re-applies that file); replicas are 3-P / 3-thread like the victim |
+| dsb `stage3-eval/configs/motiv-sm110p.yaml` | motiv-ext-bursty with the victim on 18,19,20 |
+| dsb `stage3-eval/run-motiv2.sh` | the 11-cell driver (resumable; `OUT=`, `CELLS=`, `DEADLINE=`) |
+| dsb `stage3-eval/tools/motiv2_report.py` | per-cell latency ratios (victim instance and service pooled over replicas), e2e, cores per pod class, CPU-group busy, neighbour ratios, SLO table |
+
+Cells: `none`, `hc-bang`, `rep{1,2,3}:samecores`,
+`rep{1,2,3}:othercores`, `rep{1,2,3}:othernode` (~5.5 min each).
