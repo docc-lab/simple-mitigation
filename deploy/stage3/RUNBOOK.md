@@ -766,3 +766,37 @@ scenarios with their matched and unmatched mitigation.
 
 Cells: `none`, `hc-bang`, `rep{1,2,3}:samecores`,
 `rep{1,2,3}:othercores`, `rep{1,2,3}:othernode` (~5.5 min each).
+
+**Added during the pass (2026-11-01/02):**
+
+- Calibration on node-4 (processing_time, victim alone on 18-20, 2.4 GHz):
+  baseline p50 58.5 / p90 80.3 kcyc, sigma50 2.73 / sigma90 1.56 (window 10),
+  **k = 0.0425**; curve flat 300-5600 rps, arrivals at search ~60 % of the
+  offered rate. Files `stage3-eval/score-verify/*node4-sm110p-smt-proc-3600*`.
+  Unmitigated motiv-sm110p: e_iso idle 0.02-0.09, bursts 0.40-0.55 -> THETA 0.15.
+- More arms: `hc-hold` (HC applied at ARM, never released, no control logic),
+  `hc-iso` (hc-hold + `HC_TARGET_IDLE_CORES=2`), `rep{1,2,3}f` (k replicas
+  forced at ARM: for scenarios processing_time cannot see), `hcrep3`
+  (hc-bang + 3 forced replicas).
+- **The 3-P victim cannot be overloaded through the chain** (knee probe: 14k /
+  20k / 28k offered -> 2.21 / 2.32 / 2.35 victim cores, chain max ~19.4k, same
+  finding as the R650). Overload scenarios use a 1-P victim on thread 18:
+  config `cpu_set: "18"` + `STAGE3_VICTIM_GOMAXPROCS=1` (new stage3-eval.sh
+  env, `kubectl set env` after deploy) and 1-P replicas
+  (`motiv2/overflow1p-*.yaml`, `OVF_PREFIX=overflow1p`), 800 + 10200 rps.
+- Other-node cells start a second cpu-sampler on node-3
+  (`cpu_usage-node-3.csv`); `motiv2_report.py` reads `cpu_usage-*.csv`.
+- Sweeps run: A (10 s bursts) twice, INT, SHORT (3 s bursts), MIXED; 46 runs.
+  **Results, caveats and how to regenerate every table:
+  `deploy/stage3/MOTIV2-RESULTS.md`.** Archive `motiv2-sm110p.tgz` (laptop).
+  Headline: harvesting is the only arm that improves the handler under
+  extrinsic bursts (1.7x -> 1.35-1.43x, zero extra cores); one off-thread
+  replica fixes the intrinsic overload at +0.75 cores while HC does nothing;
+  in MIXED only hc + other-node replicas meet the total SLO (2.62 cores).
+- Predictor collection on this cluster (sec 13 layout question): configs are
+  generated per layout, `python3 tools/gen_collect_configs.py --layout sm110p`
+  -> `configs/collect-sm110p/` (victim 18,19,20; pool = July's unpinned
+  `0-13,16-29`, alt pool = siblings only `2,3,4`), run with
+  `PLAN=configs/collect-sm110p/plan.txt OUT=collect-sm110p ./run-collect.sh`.
+  Started 2026-11-02 03:05 UTC (25 points, ~2.5 h); live scores are valid
+  processing_time scores this time (k 0.0425 ConfigMap deployed).
