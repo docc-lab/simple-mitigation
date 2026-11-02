@@ -16,7 +16,7 @@ plot_real_run.py's loaders (same 1 s count-weighted reduction of the
 per-window percentiles, same tick-mean score reduction).
 
   python3 simulation/plot_motiv.py --root <dir with none/ hc-bang/ horizontal-any/> \
-      --theta 0.15 --out simulation/results/motiv_ext_bursty_timeseries.png
+      --theta 0.15 --out simulation/results/2026-10-motiv-8360y/motiv_ext_bursty_timeseries.png
 """
 import argparse
 import csv

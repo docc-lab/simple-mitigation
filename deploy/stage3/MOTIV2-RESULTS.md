@@ -47,7 +47,7 @@ Files: `stage3-eval/score-verify/{gordion,curve}-node4-sm110p-smt-proc-3600.*`,
 concurrent sweep (k 0.0184) and discarded.
 
 **Protocol.** Phased stage-3 run, 140 s: p1 0–20 s victim only; p2 20–80 s
-contention present, mitigation disarmed; ARM at 80 s; p3 80–140 s armed.
+contention present, mitigation disabled; mitigation enabled at 80 s; p3 80–140 s with it enabled.
 Victim offered 3600 rps (exp) in the extrinsic scenarios. Per run the
 orchestrator also records, new in this pass:
 
@@ -62,14 +62,14 @@ orchestrator also records, new in this pass:
 
 **Arms** (`deploy/stage3/arms/*.env`):
 
-| arm | what happens at ARM |
+| arm | what happens when enabled (80 s) |
 |---|---|
 | `none` | nothing |
 | `hc-bang` | HC bang-bang on e_iso (θ_on 0.15, release after 50 windows below θ_off); victim's three physical cores become exclusive while on, aggressors confined to Secondary + idle victim threads |
-| `hc-hold` | HC applied unconditionally at ARM and never released (no control logic) |
-| `hc-iso` | hc-hold + `HC_TARGET_IDLE_CORES=2` |
+| `hc-hold` | HC applied unconditionally when enabled and never released (no control logic) |
+| `hc-iso` | hc-hold + `HC_TARGET_IDLE_CORES=2` (HC's own idle-core target, not our signal; run in trial 2, **excluded from all figures and tables** per the user, 2026-11-02: handler 1.37×, 2.36 cores taken, no gain over hc-hold) |
 | `rep{1,2,3}` | horizontal scale-out on the e_iso > 0.15 trigger, `N_MAX=k`, 2 s cooldown, no scale-in |
-| `rep{1,2,3}f` | the same k replicas forced at ARM (θ_on = −1), for scenarios the score cannot see |
+| `rep{1,2,3}f` | the same k replicas forced when enabled (θ_on = −1), for scenarios the score cannot see |
 | `hcrep3` | hc-bang + 3 forced replicas |
 
 Replica placement is a manifest swap (`stage3-eval/motiv2/overflow-*.yaml`
@@ -79,15 +79,15 @@ node-3 CPUs 2–4. 3-P replicas (`GOMAXPROCS 3`, limit 3) in the 3-P
 scenarios; 1-P replicas (`overflow1p-*.yaml`, one thread each: 18 / 21,22,23 /
 node-3 2,3,4) in the 1-P overload scenarios.
 
-**Metrics.** All ratios are armed window ÷ p1 of the same run (p1 = [2, 20) s,
-armed = the aggressor-burst windows after ARM, or the whole p3 for steady
+**Metrics.** All ratios are enabled window ÷ p1 of the same run (p1 = [2, 20) s,
+enabled = the aggressor-burst windows after enabling, or the whole p3 for steady
 scenarios). Percentiles are per-100 ms-window percentiles, count-weighted.
 
 - *handler* = `processing_time` of the victim **instance** (what the score sees);
 - *service total* = `total_time` pooled over victim + replicas (what the
   caller sees from `search`; it is >99 % blocking on the geo/rate calls);
 - *e2e* = wrk2 at the frontend (whole-run aggregate, see caveats);
-- *cores* = cgroup CPU-seconds ÷ wall over the armed windows, per pod class
+- *cores* = cgroup CPU-seconds ÷ wall over the enabled windows, per pod class
   (victim / overflow replicas on node-4 / replicas on node-3 / aggressors);
 - *busy* = per-CPU-group busy fraction (victim 18–20, siblings 2–4, replica
   threads 21–29, rest of the pool).
@@ -107,14 +107,13 @@ burst plateau 0.40–0.55 (θ 0.15 is comfortably in between). Aggressors burn
 every cell (harvesting does not starve them).
 
 Trial 1 = `data/motiv2` (21:50–22:57), trial 2 = `data/motiv2-t2`
-(01:18–02:37, adds hc-hold and hc-iso). Handler p90 ratio, armed bursts / p1:
+(01:18–02:37, adds hc-hold). Handler p90 ratio, enabled bursts / p1:
 
-| cell | trial 1 | trial 2 | handler p90 µs (t2, p1 → armed) | victim cores t1 / t2 | replica cores t1 / t2 |
+| cell | trial 1 | trial 2 | handler p90 µs (t2, p1 → enabled) | victim cores t1 / t2 | replica cores t1 / t2 |
 |---|---|---|---|---|---|
 | none | 1.72 | 1.66 | 32.9 → 54.6 | 1.27 / 1.21 | – |
 | hc-bang | 1.42 | 1.43 | 32.6 → 46.7 | 1.08 / 1.10 | – |
 | hc-hold | 1.36 | 1.35 | 34.0 → 45.9 | 1.07 / 1.10 | – |
-| hc-iso | – | 1.37 | 32.6 → 44.8 | – / 1.09 | – |
 | rep1 samecores | 2.19 | 2.10 | 32.6 → 68.4 | 0.84 / 0.81 | 0.81 / 0.77 |
 | rep1 othercores | 1.87 | 1.88 | 32.7 → 61.7 | 0.84 / 0.84 | 0.86 / 0.92 |
 | rep1 othernode | 1.92 | 1.76 | 34.0 → 59.8 | 0.84 / 0.86 | n/a / 0.72 |
@@ -141,8 +140,8 @@ total nor e2e latency discriminates in this scenario**; only the handler does.
    handler: 1.7× → 1.35–1.43×, repeatable to ±0.02 across trials. It still
    misses a 1.2× handler SLO; it meets 1.5×. hc-hold (no control loop) is as
    good as or slightly better than bang-bang (bang-bang released and
-   re-applied 6–7 times per run, first action 2.4–3.2 s after ARM; hc-hold
-   fires once at +1.7 s). hc-iso brings nothing over hc-hold.
+   re-applied 6–7 times per run, first action 2.4–3.2 s after enabling; hc-hold
+   fires once at +1.7 s).
 2. Replication never meets any handler SLO and makes the **instance** worse
    the more replicas there are: the victim's own handler slows from 1.7× to
    1.8–3.0× because the replicas add load to the same node (othercores: the
@@ -162,7 +161,7 @@ total nor e2e latency discriminates in this scenario**; only the handler does.
 
 ---
 
-## 3. INT — intrinsic overload (1-P victim), no aggressors
+## 3. INT — intrinsic steady (1-P victim self-overload), no aggressors
 
 Why 1-P: the 3-P victim cannot be overloaded through the frontend chain on
 this cluster. Knee probe (no aggressors, wrk2 8 threads / 512 conns): 14k rps
@@ -173,14 +172,14 @@ victim showed nothing (total p90 5.1 ms flat) and is kept only as
 `data/.motiv2-int-invalid-10k`. The overload scenarios therefore use
 `cpu_set "18"` + `STAGE3_VICTIM_GOMAXPROCS=1` (per-config, the 3-P scenarios
 are untouched), 1-P replicas, and 800 rps base + 10200 rps extra from t = 20 s
-(`configs/motiv-sm110p-int.yaml`). Replication arms are forced at ARM
+(`configs/motiv-sm110p-int.yaml`). Replication arms are forced when enabled
 (`rep*f`) because processing_time is blind to run-queue wait — the score stays
 at 0 through the whole overload, which is the documented limitation, not a
 bug of this pass.
 
-`data/motiv2-int`, 23:11–00:06. Armed = whole p3 (`--steady`).
+`data/motiv2-int`, 23:11–00:06. Enabled window = whole p3 (`--steady`).
 
-| cell | handler p90 ratio | total p90 p1 → armed (ms) | service total p90 ratio | victim cores | replica cores | extra driver e2e p50/p90/p99 (ms) @ rps |
+| cell | handler p90 ratio | total p90 p1 → enabled (ms) | service total p90 ratio | victim cores | replica cores | extra driver e2e p50/p90/p99 (ms) @ rps |
 |---|---|---|---|---|---|---|
 | none | 0.87 | 5.0 → 18.0 | 3.56 | 1.00 | – | 22 / 66 / 125 @ 10161 |
 | hc-hold | 0.88 | 4.9 → 23.8 | 4.90 | 0.99 | – | 37 / 118 / 292 @ 10177 |
@@ -210,7 +209,7 @@ bug of this pass.
    p50 2.2 s, driver falls to 9.1k rps.
 5. The rep2f cells show whole-run e2e p99 tails of 1.4–2.7 s with no errors
    while their in-service totals are the best of the sweep; the likely cause
-   is the scale-up transient at ARM (endpoint changes, cold replicas). Not
+   is the scale-up transient when enabled (endpoint changes, cold replicas). Not
    verified from a time series.
 
 ---
@@ -226,7 +225,7 @@ only 1.14× (32.4 → 36.9 µs) and every cell meets both SLOs:
 | cell | handler p90 ratio | total p90 ratio | victim + replica cores | aggressor cores | notes |
 |---|---|---|---|---|---|
 | none | 1.14 | 0.90 | 0.99 | 0.81 | |
-| hc-bang | 1.19 | 0.92 | 1.03 | 0.80 | first action 4.2 s after ARM — after the burst ended; 6 toggles |
+| hc-bang | 1.19 | 0.92 | 1.03 | 0.80 | first action 4.2 s after enabling — after the burst ended; 6 toggles |
 | hc-hold | 1.14 | 0.90 | 1.01 | 3.05 | aggressor cores value unexplained (window alignment?) |
 | rep3 othercores | 1.21 | 0.91 | 0.76 + 1.28 = 2.04 | 1.20 | only cell to break the 1.2× handler SLO |
 | rep3 othernode | 1.18 | 0.91 | 0.77 + 1.06 = 1.83 | 1.41 | 2 of 3 replicas came up in time |
@@ -277,7 +276,7 @@ burst-only and not directly comparable).
    run.
 4. The extra driver's e2e numbers for this sweep (p50 4–17 s in every cell)
    are **not usable**: wrk2 aggregates t = 20–140 s and a backlog builds during
-   the 60 unmitigated seconds of p2; only the in-service total p90 of the armed
+   the 60 unmitigated seconds of p2; only the in-service total p90 of the enabled
    window is meaningful here. Neighbour columns (`SS p50` 9.2 in
    hcrep3-othercores) are from a single aggressor pod's own stream and noisy.
 
@@ -288,7 +287,7 @@ burst-only and not directly comparable).
 | scenario | matched | unmatched | cheapest cell meeting the SLO | consumed cores (victim + replicas) | notes |
 |---|---|---|---|---|---|
 | extrinsic bursts (A) | harvesting | replication | hc-hold / hc-bang at 1.5× handler | 1.08–1.10 (vs 1.21–1.27 none) + 3 sibling threads reclaimed | no cell meets 1.2×; replication 1.8–3.0× at 1.6–2.3 cores |
-| intrinsic overload (INT) | replication | harvesting | rep1f othercores/othernode at 1.5× total | 1.75 (vs 1.00 none) | hc-hold 0.99 cores, no effect; samecores 10× worse |
+| intrinsic steady (INT) | replication | harvesting | rep1f othercores/othernode at 1.5× total | 1.75 (vs 1.00 none) | hc-hold 0.99 cores, no effect; samecores 10× worse |
 | both (MIXED) | hc + replication | either alone | hcrep3 othernode at 1.5× total | 2.62 | handler still 1.26×; same-node variant needs HC Primary over the replica threads |
 | 3 s bursts (SHORT) | – | – | everything (no contention materialises) | – | inconclusive |
 
@@ -333,7 +332,7 @@ replication = k × 3 threads (3-P) or k × 1 thread (1-P) added.
 ```
 C:\tmp\motiv2\                     (= simple-mitigation-1/motiv2-sm110p.tgz)
   data/motiv2/<cell>/stage3eval_*/   sweep A trial 1 (12 cells), report.csv
-  data/motiv2-t2/<cell>/...          sweep A trial 2 (13 cells, + hc-hold, hc-iso)
+  data/motiv2-t2/<cell>/...          sweep A trial 2 (13 cells, + hc-hold and the excluded hc-iso)
   data/motiv2-int/<cell>/...         INT (9 cells)
   data/motiv2-short/<cell>/...       SHORT (5 cells)
   data/motiv2-mixed/<cell>/...       MIXED (7 cells)
@@ -367,18 +366,57 @@ OVF_PREFIX=overflow1p` for the 1-P scenarios (RUNBOOK section 15).
 
 ## 8b. Figures
 
-`simulation/results/motiv2_*.{png,pdf}`, rendered by
-`stage3-eval/tools/motiv2_plot.py --root C:/tmp/motiv2/data --out simulation/results`
+`simulation/results/2026-11-motiv2-sm110p/motiv2_*.{png,pdf}` (results/ has one
+dated sub-directory per experiment, see its README), rendered by
+`stage3-eval/tools/motiv2_plot.py --root C:/tmp/motiv2/data --out simulation/results/2026-11-motiv2-sm110p`
 (reads the per-sweep `report.csv` for the bar/scatter figures and the raw run
 dirs for the time series):
 
+Conventions (user, 2026-11-02): every latency axis is a raw number
+(handler p90 in µs, service total p90 in ms); per cell two bars, quiet (p1)
+and under contention with the mitigation on (p3 window), with the ratio
+written on the second bar; one SLO line at its absolute value (`--slo`,
+default 1.5× the quiet mean); sweep A's two trials collapse to one bar with a
+min–max error bar; time series overlay the cells in two panels (the burst
+timing is identical in every run); the MIXED scenario and the cores-vs-SLO
+scatter are not plotted (section 5 keeps MIXED's numbers; `--only ts_mixed`
+still renders its time series).
+
 | file | what |
 |---|---|
-| `motiv2_bars` | per scenario (A / INT / MIXED): latency ratio per cell with the SLO lines, over the consumed cores stacked as victim + replicas (hatched = on node-3); sweep A shows both trials |
-| `motiv2_cores_vs_slo` | the headline: consumed cores (x) vs the scenario's discriminating latency ratio (y, log); dashed 1.5×, dotted 1.2×; colour = mitigation family, marker = placement |
-| `motiv2_ts_ext` | sweep A trial 2, six cells: handler p90 per second; siblings / victim-thread busy fraction and replica cores; e_iso with the actuator state (HC held or replica count). Shows the siblings being cleared by HC, the bang-bang limit cycle, and the handler getting worse as replicas arrive |
-| `motiv2_ts_int` | INT, six cells: pooled service total p90 (log), victim / replica cores per second, handler p90 (flat: blind to the overload) |
-| `motiv2_ts_mixed` | MIXED, six cells: handler p90, service total p90 (log), sibling busy + replica cores. Harvesting flattens row 1, replication drops row 2, only the combination does both |
+| `motiv2_bars` | A (extrinsic) and B (intrinsic): quiet vs under-contention latency per cell over the cores consumed meanwhile, stacked as victim + replicas (hatched = on node-3), total written on each stack; the uncapped `rep6` cells (section 8c) are appended when `data/motiv2-uncap` exists |
+| `motiv2_ts_ext` | sweep A trial 2, cells overlaid: handler p90 per second; cores consumed by victim + replicas, plus the victim cores HC lends to the aggressors (balancer log, dashed blue) |
+| `motiv2_ts_int` | INT, cells overlaid: pooled service total p90 (log); cores consumed by victim + replicas |
+
+## 8c. Uncapped replication (queued 2026-11-02 04:52 UTC)
+
+User: the controller should be allowed to add replicas until it reaches the
+SLO, and only if it cannot should a larger fixed number be plotted. The
+rep1–3 arms are the controller's own replication actuator (trigger e_iso >
+0.15, +1 replica per 2 s cooldown, no scale-in) with the cap `N_MAX` = 1, 2, 3;
+in every sweep-A run it reached its cap within 2–6 s, because replicas never
+bring e_iso down (per-core handler slowdown; the siblings stay loaded), so an
+uncapped controller climbs until the placement runs out of threads. New arm
+`rep6.env` (`N_MAX=6`) and placement `motiv2/overflow-othernodewide.yaml`
+(node-3, 24-thread `CPU_SET`, so six 3-P replicas get their own threads);
+cells `rep6:othernodewide` and `rep6:othercores` (six replicas time-sharing
+node-4's threads 21–29 — the honest same-node version, there are no more free
+cores) run after the predictor collection sweep (`/local/queue-uncap.sh` on
+node-0, log `/tmp/queue-uncap.log`, output `data/motiv2-uncap`). The bars
+figure appends them automatically.
+
+## 8d. Rounds queued after the uncapped cells (2026-11-02 05:50 UTC)
+
+User: more runs for error bars on every bar and to iterate the replica count.
+Queued on node-0 (`/local/queue-t2.sh`, then `/local/queue-r3.sh`): intrinsic
+steady trial 2 (`data/motiv2-int-t2`), uncapped rep6 trial 2
+(`data/motiv2-uncap-t2`), extrinsic sweep trial 3 (`data/motiv2-t3`, 12 cells,
+no hc-iso), replica-count iteration `rep4` / `rep5` / `rep8` on node-3's wide
+CPU set, two trials (`data/motiv2-nrep`, `data/motiv2-nrep-t2`; arms
+`rep4.env`, `rep5.env`, `rep8.env` = rep6 with another cap). Archives
+`/tmp/round2.tgz` (also the predictor collection sweep) and `/tmp/round3.tgz`
+on node-0. Plot script to extend: add `motiv2-t3` to the extrinsic sweeps and a
+replica-count panel from `motiv2-nrep*`.
 
 ## 9. Open follow-ups
 

@@ -657,7 +657,9 @@ the total_time one is `score-verify/calibration/total_time-20261022/`.
 
 **Figure.** `simulation/plot_motiv.py --root <dir with none/ hc-bang/ horizontal-any/> --theta 0.15`
 (derived from `plot_real_run.py`'s loaders) writes
-`simulation/results/motiv_ext_bursty_timeseries.{png,pdf}`: per arm, handler
+`simulation/results/2026-10-motiv-8360y/motiv_ext_bursty_timeseries.{png,pdf}`
+(moved there 2026-11-02; results/ has one dated sub-directory per experiment,
+see its README): per arm, handler
 execution (processing p50/p90), victim service latency (total p50/p90) and
 e_iso with the actuator state (HC held / overflow replicas), bursts shaded.
 The hc-bang column shows the limit cycle directly: processing p90 snaps back
