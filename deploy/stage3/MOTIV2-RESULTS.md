@@ -365,6 +365,21 @@ OVF_PREFIX=overflow1p` for the 1-P scenarios (RUNBOOK section 15).
 
 ---
 
+## 8b. Figures
+
+`simulation/results/motiv2_*.{png,pdf}`, rendered by
+`stage3-eval/tools/motiv2_plot.py --root C:/tmp/motiv2/data --out simulation/results`
+(reads the per-sweep `report.csv` for the bar/scatter figures and the raw run
+dirs for the time series):
+
+| file | what |
+|---|---|
+| `motiv2_bars` | per scenario (A / INT / MIXED): latency ratio per cell with the SLO lines, over the consumed cores stacked as victim + replicas (hatched = on node-3); sweep A shows both trials |
+| `motiv2_cores_vs_slo` | the headline: consumed cores (x) vs the scenario's discriminating latency ratio (y, log); dashed 1.5×, dotted 1.2×; colour = mitigation family, marker = placement |
+| `motiv2_ts_ext` | sweep A trial 2, six cells: handler p90 per second; siblings / victim-thread busy fraction and replica cores; e_iso with the actuator state (HC held or replica count). Shows the siblings being cleared by HC, the bang-bang limit cycle, and the handler getting worse as replicas arrive |
+| `motiv2_ts_int` | INT, six cells: pooled service total p90 (log), victim / replica cores per second, handler p90 (flat: blind to the overload) |
+| `motiv2_ts_mixed` | MIXED, six cells: handler p90, service total p90 (log), sibling busy + replica cores. Harvesting flattens row 1, replication drops row 2, only the combination does both |
+
 ## 9. Open follow-ups
 
 1. Same-node fair combination for MIXED: HC Primary extended over the replica
