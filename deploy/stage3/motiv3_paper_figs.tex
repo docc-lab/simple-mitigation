@@ -1,0 +1,32 @@
+% motiv3_paper_figs.tex -- the two paper-style motivation figures (2026-11-17), with their draft captions.
+% Figures: simulation/results/2026-11-motiv3-c6320/motiv3_eqx_tail.pdf and motiv3_tsx_rep6.pdf, copied to figs/.
+% Produced by dsb_hd_counter-s3 hotelReservation/noisy-neighbors/stage3-eval/tools/motiv3_paper.py (fig_eqx, fig_tsx):
+%   MOTIV_LAYOUT=c6320 python tools/motiv3_paper.py --root C:/tmp/motiv3/data \
+%     --out <simple-mitigation-1>/simulation/results/2026-11-motiv3-c6320 --only eqx_tail,tsx
+% Captions are long on purpose (to be trimmed). The tail cell has 2 trials per configuration, not 3.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\linewidth]{figs/motiv3_eqx_tail.pdf}
+  \caption{Harvesting (matched) mitigates bursts; replication (mismatched) fails. Under 10\,\% co-tenant bursts,
+    harvesting keeps the victim's p95 within the SLO (78\,$\mu$s) on its own two cores, even lending 0.4 of them to the
+    aggressors; replication allocates up to six more cores and still misses it (93\,$\mu$s), barely better than no
+    mitigation (106\,$\mu$s). Each box sits at that configuration's p95 latency during the bursts (dot: median; bar:
+    min--max over 2 trials) and shows the victim's two allocated cores, filled with CPU time used by the victim
+    (purple) or by replicas (orange; they run on their own cores and are stacked here for comparison), lent to the
+    aggressors (blue), or idle (gray). Dotted: the victim's p95 outside the bursts (70\,$\mu$s); the SLO is
+    1.3$\times$ that (91\,$\mu$s).}
+  \label{fig:motiv-tower}
+\end{figure}
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\linewidth]{figs/motiv3_tsx_rep6.pdf}
+  \caption{Zoom-in on replication: replicas arrive too late for bursts (trial 1). After replication is enabled at
+    120\,s, the first replica is ready at 156\,s, as the 6\,s burst it reacts to ends (158\,s); during the next burst
+    (212\,s) the victim's p95 still exceeds the SLO with a replica running, while the allocation grows to eight cores
+    of which the victim and its replicas use under one. Top: the victim's p95 latency per second (beige: co-tenant
+    bursts; dashed: SLO). Bottom: cores allocated to the victim and its replicas (outline, gray when idle) and the
+    CPU time they use (purple: victim; orange: replicas).}
+  \label{fig:motiv-ts}
+\end{figure}

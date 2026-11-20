@@ -15,3 +15,6 @@ vendor/
 simulation/data/
 simulation/results/
 __pycache__/
+
+# raw experiment data tarballs and their checksums/index (kept on the laptop only)
+archives/

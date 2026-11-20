@@ -27,7 +27,7 @@ command -v protoc-gen-go >/dev/null && command -v protoc-gen-go-grpc >/dev/null 
 make proto
 CGO_ENABLED=0 go build -o "$BUILD/mitigation-controller" ./cmd/mitigation-controller
 
-cp "$HERE/run-mitigation.sh" "$BUILD/"
+cp "$HERE/run-mitigation.sh" "$HERE/cpu-sampler.sh" "$BUILD/"
 cp -r "$HERE/arms" "$BUILD/"
 cp "$REPO/sim/real/targets.yaml" "$BUILD/targets.yaml"
 cp "$REPO/sim/offline/policy-formula.yaml" "$BUILD/policy-formula.yaml"
@@ -36,7 +36,7 @@ if [[ -r "$HOME/.kube/config" ]]; then
 else
     sudo cat /etc/kubernetes/admin.conf > "$BUILD/kubeconfig-admin"
 fi
-chmod +x "$BUILD/run-mitigation.sh" "$BUILD/mitigation-controller"
+chmod +x "$BUILD/run-mitigation.sh" "$BUILD/cpu-sampler.sh" "$BUILD/mitigation-controller"
 # mktemp -d is 0700 and tar applies "."'s mode to the kit dir; the
 # orchestrator reads the kit and its logs as the normal user.
 chmod 755 "$BUILD"

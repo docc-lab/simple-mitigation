@@ -1,0 +1,138 @@
+% motivation.tex -- motivation section, paper-style draft (2026-11-11), ~1.5 two-column pages
+% (~800 words + Table 1 + two column-width figures at ~0.3 page each).
+% \input{} this file; needs \usepackage{booktabs,xspace,graphicx} and
+% figs/motiv3_{bars,int}.pdf (from simulation/results/2026-11-motiv3-c6320/).
+% Numbers: MOTIV3-RESULTS.md sec 3 (c6320; bursty 2 trials, steady 3 trials).
+% TODO (2026-11-11): the EQ budget sweep (queues/queue-eq.sh, data/eq) is running; refresh the two result
+% subsections for EQ1 (degradation removed at one common SLO) and EQ2 (cores needed to meet it) when it lands.
+
+\newcommand{\hc}{HC\xspace}
+
+\section{Motivation}
+\label{sec:motivation}
+
+\subsection{Symptom and source}
+\label{sec:motiv-problem}
+
+\begin{table}[t]
+  \centering
+  \small
+  \begin{tabular}{l|cc}
+    \toprule
+    & \textbf{Steady} & \textbf{Tail} \\
+    \midrule
+    \textbf{Intrinsic} & Replication & Harvesting CPUs or CPU shares \\
+    \textbf{Extrinsic} & Migration & Migration, Harvesting CPUs or CPU shares \\
+    \bottomrule
+  \end{tabular}
+  \caption{Mapping of a contention's source (rows) and symptom (columns) to the mitigation it requires.}
+  \label{tab:grid}
+\end{table}
+
+CPU contention on a latency-critical service has two independent dimensions
+that together decide which mitigation can help (Table~\ref{tab:grid}).
+Each cell needs its own mitigation because the cells differ in what is
+starved and for how long: a steady intrinsic symptom lacks sustained
+capacity, which only \emph{replication} adds, whereas a tail extrinsic
+symptom needs isolated CPU capacity for milliseconds, so \emph{harvesting}
+confines the neighbour for the burst and returns the victim's idle cores
+afterwards. A mismatched mitigation does not help, or is much less
+efficient than the matched one. Replication, which reacts in seconds,
+cannot act in time against a tail contention and leaves the contended
+instance serving; harvesting against a steady intrinsic contention
+saturates at the node's already overwhelmed cores without giving the
+service the capacity headroom it needs.
+
+We validate this grid on its two diagonal cells, tail extrinsic and
+steady intrinsic, with both actuators, so that each meets one cell that
+matches it and one that does not, by answering two evaluation questions:
+\begin{itemize}
+  \item \textbf{EQ1.} Under each contention scenario (symptom $\times$
+  source) and for the same SLO target, how much of the degradation do the
+  matched mitigation and a mismatched one remove, respectively?
+  \item \textbf{EQ2.} To reach the same SLO target, how large a core budget
+  do the matched mitigation and a mismatched one require, respectively?
+\end{itemize}
+
+\subsection{Setup}
+\label{sec:motiv-setup}
+
+Five CloudLab c6320 nodes (2$\times$14-core Xeon E5-2683\,v3, SMT on,
+2.0\,GHz pinned, Linux~6.12 with the \hc module, Kubernetes~1.25). The
+victim is DeathStarBench \textsf{hotelReservation}'s \textsf{search}, with
+an in-pod scorer that reports per-request processing time as an
+interference score $e_{\mathrm{iso}}$; replicas go to a reserved node.
+\emph{Tail extrinsic:} the victim runs two threads at 2000\,rps (0.96~cores,
+knee ${\approx}6000$); seven \textsf{socialNetwork} and \textsf{sockshop}
+services share the node, free over a 12-core pool that includes the
+victim's sibling threads, and burst for 6\,s every 60\,s (6.7--7.6~cores,
+10\% of the time): two bursts with mitigation disabled, then two with it
+enabled. \emph{Steady intrinsic:} a one-thread victim (knee 4000\,rps)
+receives 800\,rps for 20\,s, then 6000\,rps for 120\,s, next to a
+lower-priority busy-loop pod on four threads; mitigation is enabled from
+the start. \emph{Harvesting} makes the victim the \hc primary and the
+co-tenants secondaries, which \hc confines to the pool minus the victim's
+threads and siblings (tail cell), or lets the victim take one of the
+busy-loop pod's threads whenever it is runnable (steady cell).
+\emph{Replication} scales a copy on the replica node: reactively on
+$e_{\mathrm{iso}}>0.15$, up to three replicas (tail cell), or one replica
+pre-provisioned (steady cell). Every arm has the same victim core budget
+and co-tenant placement. We report service-level latency relative to the
+run's quiet phase: p95 inside the bursts (SLO 1.3$\times$) and p50 of the
+overload (SLO 2.5$\times$).
+
+\subsection{Tail symptom, extrinsic source}
+\label{sec:motiv-tail}
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\linewidth]{figs/motiv3_bars.pdf}
+  \caption{Tail extrinsic: victim latency in and between the bursts relative to its quiet phase, and cores per arm. Dashed: SLO 1.3$\times$.}
+  \label{fig:motiv-bars}
+\end{figure}
+
+Unmitigated, the bursts raise the victim's p95 by 1.4--1.6$\times$ while p50
+moves 1.1$\times$ (Fig.~\ref{fig:motiv-bars}): a tail symptom from
+per-request slowdown, although the victim uses under half its cores.
+Harvesting, the matched mitigation, holds p95 at 1.07--1.12$\times$ with no
+extra cores; the co-tenants leave the victim's cores and siblings while it
+is busy, still receive its 0.4 idle cores, and keep 5.9--6.1 of their
+6.7--7.6 cores. Replication, the mismatched one, cannot help the burst that
+triggers it: the first replica serves 3--5\,s into a 6\,s burst, the
+contended instance keeps serving its share, and p95 stays at
+1.3--1.4$\times$; three pre-provisioned replicas on an earlier cluster
+still gave 1.30$\times$ (none 1.84$\times$). It also raises the latency
+between bursts to 1.10$\times$, as scale-in lags by 30\,s.
+
+\subsection{Steady symptom, intrinsic source}
+\label{sec:motiv-steady}
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\linewidth]{figs/motiv3_int.pdf}
+  \caption{Steady intrinsic: p50 of the overload relative to the quiet phase (dashed: SLO 2.5$\times$), and latency and cores over time.}
+  \label{fig:motiv-int}
+\end{figure}
+
+Unmitigated, the victim is past its knee and the whole distribution shifts:
+p50 is 8--9$\times$ quiet in two trials and 95$\times$ in the third
+(Fig.~\ref{fig:motiv-int}). Replication, the matched mitigation, brings it
+to 2.4$\times$ (5.4\,ms) and meets the SLO; harvesting, the mismatched one,
+to 3.1$\times$ (7.0\,ms) and misses it. The replica is a second full
+instance on its own thread (0.88 + 0.88 cores), whereas the harvested
+thread is shared and reclaimed on demand and the victim reaches 1.37 cores
+of it. A sweep from 3000 to 8000\,rps shows the two tie up to 3500\,rps,
+where one harvested thread suffices, and the replication-to-harvesting p50
+ratio falls to 0.77 at 6000 and 0.63 at 8000. Harvesting costs the
+busy-loop pod a thread only while the victim needs it; replication costs
+0.9~cores on a second node for the whole overload.
+
+\paragraph{Takeaway.}
+The diagonal of Table~\ref{tab:grid} holds: harvesting removes a tail
+extrinsic symptom at its source with no extra cores where replication
+recovers at most a third of it, and replication removes a steady intrinsic
+symptom where harvesting saturates at the node's idle cores. The symptom
+decides which statistic is hurt and whether a reactive mechanism can act
+in time; the source decides whether confinement or capacity is the remedy.
+A mitigation controller therefore needs more than one actuator, and a
+signal that places the contention in the grid before it acts.
